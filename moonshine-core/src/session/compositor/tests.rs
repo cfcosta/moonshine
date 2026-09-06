@@ -33,6 +33,9 @@ mod popup_input;
 #[path = "popup_serial_tests.rs"]
 mod popup_serial;
 
+#[path = "popup_touch_serial_tests.rs"]
+mod popup_touch_serial;
+
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum ClientEvent {
 	Configure(u32, u32),

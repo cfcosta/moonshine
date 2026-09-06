@@ -272,6 +272,25 @@ fn popup_destroying_its_root_releases_grabs_and_clears_keyboard_focus() {
 }
 
 #[test]
+fn popup_destroying_an_inactive_window_does_not_dismiss_the_active_menu() {
+	let mut h = Harness::new();
+	let inactive = root(&mut h);
+	let active = root(&mut h);
+	h.move_pointer(30, 30);
+	let serial = h.press_pointer();
+	let popup = grabbed_popup(&mut h, &active.xdg_surface, (100, 100, 160, 100), serial);
+	h.input(CompositorInputEvent::MouseButtonUp { button: 0x110 });
+	h.client.events.clear();
+	inactive.toplevel.destroy();
+	inactive.xdg_surface.destroy();
+	inactive.surface.destroy();
+	h.roundtrip();
+	assert!(!h.client.events.contains(&ClientEvent::PopupDone(popup.popup.id().protocol_id())), "destroying another window must not cancel the active root's menu");
+	assert_eq!(h.client.keyboard_focus, Some(popup.surface.id().protocol_id()));
+	assert!(h.state.seat.get_keyboard().unwrap().is_grabbed());
+}
+
+#[test]
 fn popup_null_buffer_unmap_releases_grabs_and_restores_root_focus() {
 	let mut h = Harness::new();
 	let root = root(&mut h);
@@ -322,4 +341,67 @@ fn popup_belonging_to_a_hidden_wsi_root_cannot_intercept_input() {
 	h.press_pointer();
 	assert!(h.client.events.iter().any(|event| matches!(event, ClientEvent::PointerButton(Some(surface), _, _, 1) if *surface == active.surface.id().protocol_id())));
 	assert!(!h.client.events.iter().any(|event| matches!(event, ClientEvent::PointerEnter(surface, _, _) if *surface == popup.surface.id().protocol_id())), "invisible menus cannot capture the streamed pointer");
+}
+
+#[test]
+fn popup_root_null_unmap_dismisses_menus_and_can_later_be_remapped() {
+	let mut h = Harness::new();
+	let root = root(&mut h);
+	h.move_pointer(30, 30);
+	let serial = h.press_pointer();
+	let popup = grabbed_popup(&mut h, &root.xdg_surface, (100, 100, 160, 100), serial);
+	h.input(CompositorInputEvent::MouseButtonUp { button: 0x110 });
+	root.surface.attach(None, 0, 0);
+	root.surface.commit();
+	h.roundtrip();
+	assert!(h.client.events.contains(&ClientEvent::PopupDone(popup.popup.id().protocol_id())), "unmapping a root must dismiss its menus");
+	assert!(h.state.seat.get_keyboard().unwrap().current_focus().is_none());
+	assert!(!h.state.seat.get_keyboard().unwrap().is_grabbed());
+	assert!(!h.state.seat.get_pointer().unwrap().is_grabbed());
+	assert!(!h.state.seat.get_touch().unwrap().is_grabbed());
+	destroy_popup(&mut h, popup);
+	root.surface.commit();
+	h.roundtrip();
+	h.map(&root.surface, 800, 600);
+	assert_eq!(h.client.keyboard_focus, Some(root.surface.id().protocol_id()), "the retained toplevel role can remap and receive input again");
+}
+
+#[test]
+fn popup_null_unmapping_a_grabbed_submenu_restores_its_parent_menu() {
+	let mut h = Harness::new();
+	let root = root(&mut h);
+	h.move_pointer(30, 30);
+	let serial = h.press_pointer();
+	let popup = grabbed_popup(&mut h, &root.xdg_surface, (100, 100, 160, 100), serial);
+	h.input(CompositorInputEvent::MouseButtonUp { button: 0x110 });
+	h.move_pointer(120, 120);
+	let serial = h.press_pointer();
+	let child = grabbed_popup(&mut h, &popup.xdg_surface, (30, 20, 80, 60), serial);
+	h.input(CompositorInputEvent::MouseButtonUp { button: 0x110 });
+	h.client.events.clear();
+	child.surface.attach(None, 0, 0);
+	child.surface.commit();
+	h.roundtrip();
+	assert!(!h.client.events.contains(&ClientEvent::PopupDone(popup.popup.id().protocol_id())), "unmapping the topmost submenu must not dismiss its parent");
+	assert_eq!(h.client.keyboard_focus, Some(popup.surface.id().protocol_id()));
+	assert!(h.state.seat.get_keyboard().unwrap().is_grabbed());
+}
+
+#[test]
+fn popup_null_unmapping_a_tooltip_does_not_release_another_popups_grab() {
+	let mut h = Harness::new();
+	let root = root(&mut h);
+	h.move_pointer(30, 30);
+	let serial = h.press_pointer();
+	let popup = grabbed_popup(&mut h, &root.xdg_surface, (100, 100, 160, 100), serial);
+	h.input(CompositorInputEvent::MouseButtonUp { button: 0x110 });
+	let tooltip = h.popup(&root.xdg_surface, (400, 400, 80, 30));
+	h.map(&tooltip.surface, 80, 30);
+	h.client.events.clear();
+	tooltip.surface.attach(None, 0, 0);
+	tooltip.surface.commit();
+	h.roundtrip();
+	assert!(!h.client.events.contains(&ClientEvent::PopupDone(popup.popup.id().protocol_id())), "a non-grabbing tooltip must not dismiss the menu's grab");
+	assert_eq!(h.client.keyboard_focus, Some(popup.surface.id().protocol_id()));
+	assert!(h.state.seat.get_keyboard().unwrap().is_grabbed());
 }
