@@ -101,6 +101,8 @@ pub(crate) enum CompositorInputEvent {
 /// Events are injected directly into the Smithay Seat — no libei needed
 /// since we *are* the compositor.
 pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
+	state.reconcile_popup_grab();
+	state.refresh_popup_pointer();
 	let serial = SERIAL_COUNTER.next_serial();
 	let time = state.clock.now().as_millis();
 
@@ -226,6 +228,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				return;
 			}
 
+			let under = find_surface_under(state);
 			pointer.motion(
 				state,
 				under,
@@ -251,6 +254,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				},
 			);
 			pointer.frame(state);
+			state.record_input_serial(serial, pointer.current_focus());
 		},
 		CompositorInputEvent::MouseButtonUp { button } => {
 			tracing::trace!(target: "input", "Mouse button up: {button:#x}");
@@ -294,6 +298,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 		CompositorInputEvent::TouchDown { slot, x, y } => {
 			let location = normalized_pointer_location(state, x, y);
 			let under = find_surface_at(state, location);
+			state.record_input_serial(serial, under.as_ref().map(|(surface, _)| surface.clone()));
 			if let Some(touch) = state.seat.get_touch() {
 				touch.down(
 					state,
@@ -367,6 +372,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			time,
 		),
 	}
+	state.reconcile_popup_grab();
 }
 
 /// A keycode plus the modifier keycodes that must be held to reach it.
@@ -715,7 +721,7 @@ fn find_surface_under(
 	find_surface_at(state, state.cursor_position)
 }
 
-fn find_surface_at(
+pub(super) fn find_surface_at(
 	state: &MoonshineCompositor,
 	position: Point<f64, Logical>,
 ) -> Option<(
@@ -741,6 +747,15 @@ fn find_surface_at(
 
 	// Priority 2: WSI override surface active — route to the focused game window.
 	if state.is_override_active() {
+		// Native menus remain composed above a WSI bypass surface. Hit-test
+		// exactly those visible trees, excluding menus belonging to other roots.
+		for (surface, origin) in state.popup_surfaces_for_render() {
+			if let Some((surface, offset)) = smithay::desktop::utils::under_from_surface_tree(
+				&surface, position, origin, WindowSurfaceType::ALL,
+			) {
+				return Some((surface, offset.to_f64()));
+			}
+		}
 		if let Some(wid) = state.focused_x11_window {
 			// XWayland path: find the focused X11 window and route events there.
 			for window in state.space.elements() {
