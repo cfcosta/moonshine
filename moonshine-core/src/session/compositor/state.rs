@@ -757,7 +757,12 @@ impl MoonshineCompositor {
 		};
 
 		// Bind the pre-allocated Dmabuf as a render target.
-		let mut framebuffer = match self.renderer.as_mut().expect("rendering requires a GPU").bind(&mut self.buffer_pool[idx].dmabuf) {
+		let mut framebuffer = match self
+			.renderer
+			.as_mut()
+			.expect("rendering requires a GPU")
+			.bind(&mut self.buffer_pool[idx].dmabuf)
+		{
 			Ok(fb) => fb,
 			Err(e) => {
 				tracing::error!("Failed to bind Dmabuf for rendering: {e}");
@@ -769,7 +774,12 @@ impl MoonshineCompositor {
 		// Collect render elements from the space.
 		let num_space_elements = self.space.elements().count();
 		let space_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-			match smithay::desktop::space::space_render_elements(self.renderer.as_mut().expect("rendering requires a GPU"), [&self.space], &self.output, 1.0) {
+			match smithay::desktop::space::space_render_elements(
+				self.renderer.as_mut().expect("rendering requires a GPU"),
+				[&self.space],
+				&self.output,
+				1.0,
+			) {
 				Ok(elements) => elements,
 				Err(e) => {
 					tracing::error!("Failed to collect render elements: {e}");
@@ -834,14 +844,18 @@ impl MoonshineCompositor {
 				return;
 			};
 			let override_elements = super::render_scene::override_render_elements(
-					self.renderer.as_mut().expect("rendering requires a GPU"),
-					override_surface,
-					&override_popups,
-				);
+				self.renderer.as_mut().expect("rendering requires a GPU"),
+				override_surface,
+				&override_popups,
+			);
 			if override_elements.is_empty() {
 				tracing::debug!("override active but surface has no committed buffer — rendering black");
 			}
-			elements.extend(override_elements.into_iter().map(|element| OutputRenderElements::Space(SpaceRenderElements::Surface(element))));
+			elements.extend(
+				override_elements
+					.into_iter()
+					.map(|element| OutputRenderElements::Space(SpaceRenderElements::Surface(element))),
+			);
 		} else {
 			if self.override_surface.as_ref().is_some_and(|(s, _)| !s.alive()) {
 				tracing::debug!("Override surface is dead, clearing.");
@@ -877,9 +891,10 @@ impl MoonshineCompositor {
 
 		let (sync, render_states) = match render_result {
 			Ok(r) => (r.sync, r.states),
-			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => {
-				(smithay::backend::renderer::sync::SyncPoint::signaled(), RenderElementStates::default())
-			},
+			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => (
+				smithay::backend::renderer::sync::SyncPoint::signaled(),
+				RenderElementStates::default(),
+			),
 			Err(e) => {
 				tracing::error!("Failed to render output: {e}");
 				return;

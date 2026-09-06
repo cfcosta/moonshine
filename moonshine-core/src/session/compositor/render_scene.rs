@@ -1,11 +1,13 @@
 //! Renderer-independent scene decisions shared with protocol regression tests.
 
-use smithay::backend::renderer::element::{Id, Kind, RenderElementStates};
 use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree};
-use smithay::backend::renderer::{ImportAll, Renderer};
+use smithay::backend::renderer::element::{Id, Kind, RenderElementStates};
 use smithay::backend::renderer::utils::with_renderer_surface_state;
+use smithay::backend::renderer::{ImportAll, Renderer};
 use smithay::desktop::PopupManager;
-use smithay::desktop::utils::{OutputPresentationFeedback, send_frames_surface_tree, take_presentation_feedback_surface_tree};
+use smithay::desktop::utils::{
+	OutputPresentationFeedback, send_frames_surface_tree, take_presentation_feedback_surface_tree,
+};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Monotonic, Point};
@@ -28,11 +30,21 @@ where
 	let mut elements = Vec::new();
 	for (surface, location) in popups {
 		elements.extend(render_elements_from_surface_tree(
-			renderer, surface, (location.x, location.y), 1.0, 1.0, Kind::Unspecified,
+			renderer,
+			surface,
+			(location.x, location.y),
+			1.0,
+			1.0,
+			Kind::Unspecified,
 		));
 	}
 	elements.extend(render_elements_from_surface_tree(
-		renderer, override_surface, (0, 0), 1.0, 1.0, Kind::Unspecified,
+		renderer,
+		override_surface,
+		(0, 0),
+		1.0,
+		1.0,
+		Kind::Unspecified,
 	));
 	elements
 }
@@ -41,14 +53,17 @@ impl MoonshineCompositor {
 	/// Popup surface trees in front-to-back order, with global surface origins.
 	pub(super) fn popup_surfaces_for_render(&self) -> Vec<(WlSurface, Point<i32, Logical>)> {
 		let override_active = self.is_override_active();
-		self.space.elements().rev()
+		self.space
+			.elements()
+			.rev()
 			.filter(|window| !override_active || self.focused_window.as_ref() == Some(*window))
 			.flat_map(|window| {
 				let location = self.space.element_location(window).unwrap_or_default();
 				window.toplevel().into_iter().flat_map(move |root| {
 					PopupManager::popups_for_surface(root.wl_surface()).filter_map(move |(popup, offset)| {
 						let surface = popup.wl_surface();
-						let mapped = with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
+						let mapped =
+							with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
 						mapped.then(|| (surface.clone(), location + offset - popup.geometry().loc))
 					})
 				})
@@ -58,9 +73,8 @@ impl MoonshineCompositor {
 
 	/// Whether cursor and popup visibility allow either single-buffer scanout path.
 	pub(super) fn can_direct_scanout_scene(&self) -> bool {
-		!self
-			.last_pointer_activity
-			.is_some_and(|time| time.elapsed() <= std::time::Duration::from_secs(3))
+		self.last_pointer_activity
+			.is_none_or(|time| time.elapsed() > std::time::Duration::from_secs(3))
 			&& self.popup_surfaces_for_render().is_empty()
 	}
 
@@ -69,27 +83,51 @@ impl MoonshineCompositor {
 		let override_active = self.is_override_active();
 		let mut feedback = OutputPresentationFeedback::new(&self.output);
 		let presented_on_output = |surface: &WlSurface, _: &smithay::wayland::compositor::SurfaceData| {
-			render_states.element_was_presented(Id::from_wayland_resource(surface)).then(|| self.output.clone())
+			render_states
+				.element_was_presented(Id::from_wayland_resource(surface))
+				.then(|| self.output.clone())
 		};
 		self.space.elements().for_each(|window| {
-			window.send_frame(&self.output, self.clock.now(), Some(std::time::Duration::ZERO), |_, _| Some(self.output.clone()));
+			window.send_frame(
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
 			if !override_active {
-				window.take_presentation_feedback(&mut feedback, presented_on_output, |_, _| wp_presentation_feedback::Kind::empty());
+				window.take_presentation_feedback(&mut feedback, presented_on_output, |_, _| {
+					wp_presentation_feedback::Kind::empty()
+				});
 			}
 		});
-		if override_active
-			&& let Some((ref surface, _)) = self.override_surface
-		{
-			send_frames_surface_tree(surface, &self.output, self.clock.now(), Some(std::time::Duration::ZERO), |_, _| Some(self.output.clone()));
-			take_presentation_feedback_surface_tree(surface, &mut feedback, presented_on_output, |_, _| wp_presentation_feedback::Kind::empty());
+		if override_active && let Some((ref surface, _)) = self.override_surface {
+			send_frames_surface_tree(
+				surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+			take_presentation_feedback_surface_tree(surface, &mut feedback, presented_on_output, |_, _| {
+				wp_presentation_feedback::Kind::empty()
+			});
 			for (popup, _) in self.popup_surfaces_for_render() {
-				take_presentation_feedback_surface_tree(&popup, &mut feedback, presented_on_output, |_, _| wp_presentation_feedback::Kind::empty());
+				take_presentation_feedback_surface_tree(&popup, &mut feedback, presented_on_output, |_, _| {
+					wp_presentation_feedback::Kind::empty()
+				});
 			}
 		}
-		let frame_period = self.output.preferred_mode()
+		let frame_period = self
+			.output
+			.preferred_mode()
 			.map(|mode| std::time::Duration::from_nanos(1_000_000_000_000u64 / mode.refresh.max(1) as u64))
 			.unwrap_or(std::time::Duration::from_millis(11));
-		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(self.clock.now(), Refresh::Fixed(frame_period), 0, wp_presentation_feedback::Kind::empty());
+		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			self.clock.now(),
+			Refresh::Fixed(frame_period),
+			0,
+			wp_presentation_feedback::Kind::empty(),
+		);
 	}
 }
 
@@ -100,20 +138,25 @@ mod tests {
 	use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
 	use smithay::utils::Point;
 
-	use super::override_render_elements;
 	use super::super::tests::Harness;
+	use super::override_render_elements;
 
 	fn render_scene(h: &mut Harness) -> RenderElementStates {
 		let mut renderer = DummyRenderer;
 		let elements = if h.state.is_override_active() {
 			let popups = h.state.popup_surfaces_for_render();
 			override_render_elements(&mut renderer, &h.state.override_surface.as_ref().unwrap().0, &popups)
-				.into_iter().map(SpaceRenderElements::Surface).collect()
+				.into_iter()
+				.map(SpaceRenderElements::Surface)
+				.collect()
 		} else {
 			space_render_elements(&mut renderer, [&h.state.space], &h.state.output, 1.0).unwrap()
 		};
-		h.state.damage_tracker.render_output(&mut renderer, &mut DummyFramebuffer, 0, &elements, [0.0, 0.0, 0.0, 1.0])
-			.expect("render actual SHM surface trees with the test backend").states
+		h.state
+			.damage_tracker
+			.render_output(&mut renderer, &mut DummyFramebuffer, 0, &elements, [0.0, 0.0, 0.0, 1.0])
+			.expect("render actual SHM surface trees with the test backend")
+			.states
 	}
 
 	#[test]
@@ -159,7 +202,10 @@ mod tests {
 		menu.surface.destroy();
 		h.roundtrip();
 
-		assert!(h.state.screen_dirty, "closing a stationary menu must repaint immediately");
+		assert!(
+			h.state.screen_dirty,
+			"closing a stationary menu must repaint immediately"
+		);
 		assert!(h.state.can_direct_scanout_scene());
 		assert!(h.state.popup_surfaces_for_render().is_empty());
 	}
@@ -214,9 +260,19 @@ mod tests {
 		let mut renderer = DummyRenderer;
 
 		let elements = override_render_elements(&mut renderer, &root_surface, &[(menu_surface, (40, 50).into())]);
-		assert_eq!(elements.len(), 2, "both menu and replacement game buffer must reach the renderer");
-		assert_eq!(elements[0].geometry(1.0.into()), smithay::utils::Rectangle::new((40, 50).into(), (120, 100).into()));
-		assert_eq!(elements[1].geometry(1.0.into()), smithay::utils::Rectangle::new((0, 0).into(), (800, 600).into()));
+		assert_eq!(
+			elements.len(),
+			2,
+			"both menu and replacement game buffer must reach the renderer"
+		);
+		assert_eq!(
+			elements[0].geometry(1.0.into()),
+			smithay::utils::Rectangle::new((40, 50).into(), (120, 100).into())
+		);
+		assert_eq!(
+			elements[1].geometry(1.0.into()),
+			smithay::utils::Rectangle::new((0, 0).into(), (800, 600).into())
+		);
 	}
 
 	#[test]
@@ -260,8 +316,14 @@ mod tests {
 		h.state.send_composited_frame_callbacks(&render_states);
 		h.roundtrip();
 
-		assert!(h.frame_done(frame), "popup animation must receive the next-frame callback");
-		assert!(h.presentation_received(presentation), "composited popup must receive presentation feedback");
+		assert!(
+			h.frame_done(frame),
+			"popup animation must receive the next-frame callback"
+		);
+		assert!(
+			h.presentation_received(presentation),
+			"composited popup must receive presentation feedback"
+		);
 	}
 
 	#[test]
@@ -284,8 +346,14 @@ mod tests {
 		h.roundtrip();
 
 		assert!(h.frame_done(root_frame) && h.frame_done(menu_frame));
-		assert!(h.presentation_received(root_presentation), "WSI present must unblock during menu composition");
-		assert!(h.presentation_received(menu_presentation), "popup must share the composed-frame presentation");
+		assert!(
+			h.presentation_received(root_presentation),
+			"WSI present must unblock during menu composition"
+		);
+		assert!(
+			h.presentation_received(menu_presentation),
+			"popup must share the composed-frame presentation"
+		);
 	}
 
 	#[test]
@@ -305,7 +373,10 @@ mod tests {
 		h.state.send_composited_frame_callbacks(&render_states);
 		h.roundtrip();
 
-		assert!(!h.presentation_received(presentation), "a hidden, inactive WSI surface was not presented");
+		assert!(
+			!h.presentation_received(presentation),
+			"a hidden, inactive WSI surface was not presented"
+		);
 	}
 
 	#[test]
@@ -318,11 +389,14 @@ mod tests {
 		let submenu = h.popup(&menu.xdg_surface, (80, 20, 90, 60));
 		h.map(&submenu.surface, 90, 60);
 		let elements = space_render_elements(&mut DummyRenderer, [&h.state.space], &h.state.output, 1.0).unwrap();
-		assert_eq!(elements.iter().map(|element| element.id().clone()).collect::<Vec<_>>(), vec![
-			Id::from_wayland_resource(&h.server_surface(&submenu.surface)),
-			Id::from_wayland_resource(&h.server_surface(&menu.surface)),
-			Id::from_wayland_resource(&h.server_surface(&root.surface)),
-		]);
+		assert_eq!(
+			elements.iter().map(|element| element.id().clone()).collect::<Vec<_>>(),
+			vec![
+				Id::from_wayland_resource(&h.server_surface(&submenu.surface)),
+				Id::from_wayland_resource(&h.server_surface(&menu.surface)),
+				Id::from_wayland_resource(&h.server_surface(&root.surface)),
+			]
+		);
 	}
 
 	#[test]
@@ -351,18 +425,28 @@ mod tests {
 		let menu = h.popup(&root.xdg_surface, (40, 50, 120, 100));
 		h.map(&menu.surface, 120, 100);
 		let covering_surface = h.server_surface(&covering_window.surface);
-		let covering = h.state.space.elements()
+		let covering = h
+			.state
+			.space
+			.elements()
 			.find(|window| window.toplevel().is_some_and(|t| t.wl_surface() == &covering_surface))
-			.cloned().unwrap();
+			.cloned()
+			.unwrap();
 		h.state.space.raise_element(&covering, false);
 		let presentation = h.request_presentation(&menu.surface);
 		h.roundtrip();
 		let render_states = render_scene(&mut h);
-		assert!(!render_states.element_was_presented(Id::from_wayland_resource(&h.server_surface(&menu.surface))), "opaque foreground window must occlude the menu");
+		assert!(
+			!render_states.element_was_presented(Id::from_wayland_resource(&h.server_surface(&menu.surface))),
+			"opaque foreground window must occlude the menu"
+		);
 
 		h.state.send_composited_frame_callbacks(&render_states);
 		h.roundtrip();
 
-		assert!(!h.presentation_received(presentation), "a completely occluded popup was not presented");
+		assert!(
+			!h.presentation_received(presentation),
+			"a completely occluded popup was not presented"
+		);
 	}
 }

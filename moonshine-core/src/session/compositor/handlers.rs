@@ -45,8 +45,8 @@ use crate::session::compositor::state::{ClientState, MoonshineCompositor};
 // Process-tree app_id detection (mirrors gamescope's get_appid_from_pid)
 // ---------------------------------------------------------------------------
 
-use std::collections::HashMap;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
 
@@ -387,7 +387,10 @@ impl CompositorHandler for MoonshineCompositor {
 			.cloned();
 		if let Some(window) = committed_window {
 			window.on_commit();
-			let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
+			let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
+				state.buffer().is_some()
+			})
+			.unwrap_or(false);
 			window.user_data().insert_if_missing(NativeWindowMapping::default);
 			let mapping = window.user_data().get::<NativeWindowMapping>().unwrap();
 			let mapping_changed = mapping.mapped.replace(mapped) != mapped;
@@ -816,7 +819,11 @@ impl MoonshineCompositor {
 	fn build_candidates(&self, windows: &[Window]) -> Vec<Window> {
 		let mut candidates = Vec::new();
 		for window in windows {
-			if window.user_data().get::<NativeWindowMapping>().is_some_and(|state| state.ever_mapped.get() && !state.mapped.get()) {
+			if window
+				.user_data()
+				.get::<NativeWindowMapping>()
+				.is_some_and(|state| state.ever_mapped.get() && !state.mapped.get())
+			{
 				continue;
 			}
 			if let Some(meta) = self.window_metadata.get(window) {
@@ -1588,7 +1595,9 @@ impl SeatHandler for MoonshineCompositor {
 	}
 
 	fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
-		let window_id = focused.and_then(|f| f.window()).and_then(|w| w.x11_surface().map(|x| x.window_id()));
+		let window_id = focused
+			.and_then(|f| f.window())
+			.and_then(|w| w.x11_surface().map(|x| x.window_id()));
 		tracing::debug!(target: "focus", window_id = ?window_id, "Keyboard focus changed");
 	}
 
@@ -1682,7 +1691,11 @@ impl DmabufHandler for MoonshineCompositor {
 			render_fourcc = format!("0x{:08X} ({:?})", self.render_fourcc as u32, self.render_fourcc),
 			"Client DMA-BUF import"
 		);
-		if self.renderer.as_mut().is_some_and(|renderer| renderer.import_dmabuf(&dmabuf, None).is_ok()) {
+		if self
+			.renderer
+			.as_mut()
+			.is_some_and(|renderer| renderer.import_dmabuf(&dmabuf, None).is_ok())
+		{
 			tracing::debug!("DMA-BUF import successful");
 			let _ = notifier.successful::<MoonshineCompositor>();
 		} else {

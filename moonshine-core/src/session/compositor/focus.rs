@@ -2,7 +2,7 @@
 //!
 //! Two concerns are handled here:
 //!
-//! 1. **KeyboardFocusTarget** — A wrapper around `Window` that implements
+//! 1. **KeyboardFocusTarget** — A window or grabbed native popup that implements
 //!    Smithay's `KeyboardTarget`, `IsAlive`, and `WaylandFocus` traits.
 //!    This is the type used by Smithay's seat keyboard focus system.
 //!
@@ -31,7 +31,7 @@ use crate::session::compositor::state::MoonshineCompositor;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum KeyboardFocusTarget {
 	Window(Window),
-	Popup(PopupKind),
+	Popup(Box<PopupKind>),
 }
 
 impl KeyboardFocusTarget {
@@ -73,7 +73,7 @@ impl From<Window> for KeyboardFocusTarget {
 
 impl From<PopupKind> for KeyboardFocusTarget {
 	fn from(popup: PopupKind) -> Self {
-		Self::Popup(popup)
+		Self::Popup(Box::new(popup))
 	}
 }
 
@@ -106,7 +106,15 @@ macro_rules! delegate_keyboard {
 impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 	delegate_keyboard!(enter(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, keys: Vec<KeysymHandle<'_>>, serial: Serial) -> ());
 	delegate_keyboard!(leave(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, serial: Serial) -> ());
-	fn key(&self, seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, key: KeysymHandle<'_>, state: KeyState, serial: Serial, time: u32) {
+	fn key(
+		&self,
+		seat: &Seat<MoonshineCompositor>,
+		data: &mut MoonshineCompositor,
+		key: KeysymHandle<'_>,
+		state: KeyState,
+		serial: Serial,
+		time: u32,
+	) {
 		// Record at delivery, not injection: a different grab may consume an
 		// injected key, and clipboard typing injects its own action serials.
 		if state == KeyState::Pressed {

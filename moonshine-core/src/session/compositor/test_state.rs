@@ -27,7 +27,8 @@ impl MoonshineCompositor {
 			usb_id: None,
 			syspath: None,
 		};
-		seat.tablet_seat().add_tablet::<Self>(&display_handle, &pen_tablet_descriptor);
+		seat.tablet_seat()
+			.add_tablet::<Self>(&display_handle, &pen_tablet_descriptor);
 		let output = Output::new(
 			"moonshine-test".into(),
 			PhysicalProperties {
@@ -38,7 +39,10 @@ impl MoonshineCompositor {
 				serial_number: "test".into(),
 			},
 		);
-		let mode = Mode { size: (800, 600).into(), refresh: 60_000 };
+		let mode = Mode {
+			size: (800, 600).into(),
+			refresh: 60_000,
+		};
 		output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
 		output.set_preferred(mode);
 		output.create_global::<Self>(&display_handle);
