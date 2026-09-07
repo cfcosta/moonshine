@@ -90,6 +90,8 @@ impl MoonshineCompositor {
 			buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
 			render_count: 0,
 			screen_dirty: true,
+			capture_trigger: Default::default(),
+			capture_available: false,
 			scene_dirty_since: None,
 			timer_lateness: std::time::Duration::ZERO,
 			capture_timing: Default::default(),

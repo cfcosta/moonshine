@@ -5,6 +5,7 @@
 //! DMA-BUFs and exported directly to the video encoder.
 
 mod buffer_timing;
+mod capture_trigger;
 mod color_management;
 mod cursor;
 mod focus;
@@ -413,10 +414,12 @@ fn run_compositor(
 				// Safety: we never drop the display while the event loop runs.
 				unsafe {
 					let display = display.get_mut();
+					let previous_revision = state.capture_trigger.revision();
 					if let Err(e) = display.dispatch_clients(state) {
 						tracing::error!("Failed to dispatch Wayland clients: {e}");
 					}
 					state.refresh_popups();
+					state.capture_after_dispatch(previous_revision);
 
 					// Send deferred wp_image_description_info_v1 destructor events.
 					for info in state.deferred_info_done.drain(..) {
@@ -463,7 +466,7 @@ fn run_compositor(
 		.handle()
 		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
 			state.timer_lateness = std::time::Instant::now().saturating_duration_since(next_frame);
-			state.render_and_export();
+			state.frame_tick();
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time
 			// jitter and keeps a steady cadence.

@@ -49,6 +49,30 @@ where
 	elements
 }
 
+/// Direct capture cannot represent an applied subsurface buffer. Use composition
+/// for that tree so synchronized child updates also participate in readiness.
+pub(super) fn single_buffer_tree(root: &WlSurface) -> bool {
+	use smithay::wayland::compositor::{TraversalAction, with_surface_tree_upward};
+	let mut single = true;
+	with_surface_tree_upward(
+		root,
+		(),
+		|_, _, _| TraversalAction::DoChildren(()),
+		|surface, states, _| {
+			if surface != root
+				&& states
+					.data_map
+					.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+					.is_some_and(|state| state.lock().unwrap().buffer().is_some())
+			{
+				single = false;
+			}
+		},
+		|_, _, _| true,
+	);
+	single
+}
+
 impl MoonshineCompositor {
 	/// Popup surface trees in front-to-back order, with global surface origins.
 	pub(super) fn popup_surfaces_for_render(&self) -> Vec<(WlSurface, Point<i32, Logical>)> {
@@ -80,8 +104,33 @@ impl MoonshineCompositor {
 			&& self.popup_surfaces_for_render().is_empty()
 	}
 
-	/// Complete callbacks after the composed frame has finished rendering.
-	pub(super) fn send_composited_frame_callbacks(&self, render_states: &RenderElementStates) {
+	/// Release clients once per timer tick, independently of captures and encoder
+	/// backpressure. Window trees include native popups and subsurfaces; the WSI
+	/// replacement also needs callbacks while a popup forces composition.
+	pub(super) fn send_frame_callbacks(&self) {
+		for window in self.space.elements() {
+			window.send_frame(
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+		}
+		if self.is_override_active()
+			&& let Some((ref surface, _)) = self.override_surface
+		{
+			send_frames_surface_tree(
+				surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+		}
+	}
+
+	/// Presentation feedback describes a rendered scene, never a pacing tick.
+	pub(super) fn send_composited_presentation_feedback(&self, render_states: &RenderElementStates) {
 		let override_active = self.is_override_active();
 		let mut feedback = OutputPresentationFeedback::new(&self.output);
 		let presented_on_output = |surface: &WlSurface, _: &smithay::wayland::compositor::SurfaceData| {
@@ -90,12 +139,6 @@ impl MoonshineCompositor {
 				.then(|| self.output.clone())
 		};
 		self.space.elements().for_each(|window| {
-			window.send_frame(
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
 			if !override_active {
 				window.take_presentation_feedback(&mut feedback, presented_on_output, |_, _| {
 					wp_presentation_feedback::Kind::empty()
@@ -103,13 +146,6 @@ impl MoonshineCompositor {
 			}
 		});
 		if override_active && let Some((ref surface, _)) = self.override_surface {
-			send_frames_surface_tree(
-				surface,
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
 			take_presentation_feedback_surface_tree(surface, &mut feedback, presented_on_output, |_, _| {
 				wp_presentation_feedback::Kind::empty()
 			});
@@ -315,7 +351,8 @@ mod tests {
 		h.roundtrip();
 
 		let render_states = render_scene(&mut h);
-		h.state.send_composited_frame_callbacks(&render_states);
+		h.state.send_frame_callbacks();
+		h.state.send_composited_presentation_feedback(&render_states);
 		h.roundtrip();
 
 		assert!(
@@ -344,7 +381,8 @@ mod tests {
 		h.roundtrip();
 
 		let render_states = render_scene(&mut h);
-		h.state.send_composited_frame_callbacks(&render_states);
+		h.state.send_frame_callbacks();
+		h.state.send_composited_presentation_feedback(&render_states);
 		h.roundtrip();
 
 		assert!(h.frame_done(root_frame) && h.frame_done(menu_frame));
@@ -372,7 +410,8 @@ mod tests {
 		h.roundtrip();
 
 		let render_states = render_scene(&mut h);
-		h.state.send_composited_frame_callbacks(&render_states);
+		h.state.send_frame_callbacks();
+		h.state.send_composited_presentation_feedback(&render_states);
 		h.roundtrip();
 
 		assert!(
@@ -443,7 +482,8 @@ mod tests {
 			"opaque foreground window must occlude the menu"
 		);
 
-		h.state.send_composited_frame_callbacks(&render_states);
+		h.state.send_frame_callbacks();
+		h.state.send_composited_presentation_feedback(&render_states);
 		h.roundtrip();
 
 		assert!(

@@ -3,6 +3,9 @@
 //! A Wayland client and server exchange messages over a private socket pair.
 //! Surfaces use real SHM buffers; no GPU, network listener, or running session is needed.
 
+#[path = "capture_trigger_tests.rs"]
+mod capture_trigger;
+
 #[path = "popup_lifecycle_tests.rs"]
 mod lifecycle;
 
@@ -18,7 +21,7 @@ use smithay::reexports::wayland_server::{Client, Display};
 use smithay::wayland::compositor::CompositorClientState;
 use wayland_client::protocol::{
 	wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_registry, wl_seat, wl_shm,
-	wl_shm_pool, wl_surface, wl_touch,
+	wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface, wl_touch,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
@@ -65,6 +68,7 @@ pub(super) enum ClientEvent {
 #[derive(Default)]
 pub(super) struct TestClient {
 	compositor: Option<wl_compositor::WlCompositor>,
+	subcompositor: Option<wl_subcompositor::WlSubcompositor>,
 	shm: Option<wl_shm::WlShm>,
 	shell: Option<xdg_wm_base::XdgWmBase>,
 	presentation: Option<wp_presentation::WpPresentation>,
@@ -384,6 +388,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for TestClient {
 		{
 			match interface.as_str() {
 				"wl_compositor" => state.compositor = Some(registry.bind(name, version.min(6), qh, ())),
+				"wl_subcompositor" => state.subcompositor = Some(registry.bind(name, 1, qh, ())),
 				"wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
 				"xdg_wm_base" => state.shell = Some(registry.bind(name, version.min(6), qh, ())),
 				"wp_presentation" => state.presentation = Some(registry.bind(name, 1, qh, ())),
@@ -627,6 +632,8 @@ impl Dispatch<wl_output::WlOutput, ()> for TestClient {
 }
 
 delegate_noop!(TestClient: ignore wl_compositor::WlCompositor);
+delegate_noop!(TestClient: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(TestClient: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(TestClient: ignore wp_presentation::WpPresentation);
 delegate_noop!(TestClient: ignore wl_region::WlRegion);
 delegate_noop!(TestClient: ignore wl_shm::WlShm);

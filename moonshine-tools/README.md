@@ -105,6 +105,28 @@ window, including time without frames. Samples must start and finish inside
 that window, excluding warmup-crossing frames. Read the counters alongside the
 latency percentiles: missing or unfinished frames have no completed latency.
 
+`capture_visible_update` counts accepted captures containing an applied buffer
+attachment/damage update to a selected visible surface, or removal of a surface
+visible in the previous accepted frame. It coalesces updates per capture and
+uses the renderer's visibility decisions (including occlusion). Callback-only
+commits and unselected/hidden surfaces do not count; synchronized child changes
+count only after their parent applies them. Geometry, focus and cursor movement
+are separate repaint reasons, so this is not a general visual-change or dropped
+frame count.
+
+Capture now runs after Wayland dispatch when an applied visible-content change
+can use the current pacing opportunity. The absolute timer sends frame callbacks
+independently for native windows, popups and the active WSI replacement. An unused
+opportunity falls back at the next tick for late content, scene-only changes and
+one-second static keepalives; opportunities do not accumulate. Each opportunity
+allows one capture attempt, including a rejected export. Pending content clears
+only on acceptance. Adjacent fallback and commit captures can straddle a tick,
+so this caps sustained rate rather than imposing a minimum inter-frame interval.
+Composition checks current clipping/occlusion before acquiring a render target,
+without advancing the render damage history. Direct capture checks the selected
+buffer without a GLES import. `timer_lateness` is zero for commit-triggered
+captures and measures deadline lateness only for timer fallback captures.
+
 Counters distinguish intentional static-screen skips from buffer-pool pressure,
 full capture queues, pre-encode drops, import/conversion/submission/readback/FEC
 failures, missing clients, and socket errors. Counter snapshots cover the wall

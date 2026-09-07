@@ -42,8 +42,9 @@ pub(crate) enum Counter {
 	SendBytes,
 	SendErrors,
 	GsoFallbackChunks,
+	CaptureVisibleUpdate,
 }
-const COUNTER_NAMES: [&str; 21] = [
+const COUNTER_NAMES: [&str; 22] = [
 	"capture_ticks",
 	"static_skips",
 	"pool_busy",
@@ -65,6 +66,7 @@ const COUNTER_NAMES: [&str; 21] = [
 	"send_bytes",
 	"send_errors",
 	"gso_fallback_chunks",
+	"capture_visible_update",
 ];
 
 #[derive(Clone)]
