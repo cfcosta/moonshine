@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
 
+use super::processes::SessionProcesses;
 use crate::ShutdownReason;
 use crate::session::FrameStats;
 use crate::session::InitializedSession;
@@ -70,6 +71,7 @@ struct SessionManagerInner {
 
 	/// The currently active session, if any.
 	session: Option<SessionState>,
+	processes: Option<Arc<SessionProcesses>>,
 
 	/// Shutdown manager for the active session, used to trigger session shutdown upon request.
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -115,6 +117,7 @@ impl SessionManagerInner {
 			handle.abort();
 		}
 		self.session = None;
+		self.processes = None;
 		self.keys_tx = None;
 		self.video_stream_context = None;
 		self.audio_stream_context = None;
@@ -129,13 +132,8 @@ impl Drop for SessionManagerInner {
 		if let Some(handle) = self.stop_watcher.take() {
 			handle.abort();
 		}
-		if self.session.is_some() {
-			tracing::debug!("Stopping active session before shutdown.");
-			let _ = self.stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
-			// Wait until shutdown completed.
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				handle.block_on(self.stop.wait_shutdown_complete());
-			}
+		if let Some(processes) = &self.processes {
+			processes.request_stop(SessionShutdownReason::ManagerShutdown);
 		}
 	}
 }
@@ -172,6 +170,7 @@ impl SessionManager {
 			stream_timeout,
 			inhibit_sleep,
 			session: None,
+			processes: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
 			video_stream_context: None,
@@ -265,7 +264,11 @@ impl SessionManager {
 	pub async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
 
-		if guard.session.is_some() || guard.keys_tx.is_some() {
+		if guard.processes.is_some()
+			|| guard.session.is_some()
+			|| guard.keys_tx.is_some()
+			|| guard.shutdown.is_shutdown_triggered()
+		{
 			tracing::warn!("Session already initialized, rejecting InitializeSession command.");
 			return Err(());
 		}
@@ -288,6 +291,10 @@ impl SessionManager {
 		let address = guard.address.clone();
 		let stop = guard.stop.clone();
 		let stats_tx = guard.stats_tx.clone();
+		let processes = Arc::new(SessionProcesses::create(stop.clone(), guard.shutdown.clone()).await?);
+		guard.processes = Some(processes.clone());
+		spawn_session_watchdog(&self.inner, &mut guard);
+		let mut cancellation = CleanupOnDrop::new(processes);
 		let session = InitializedSession::new(
 			compositor_config,
 			video_config,
@@ -301,7 +308,7 @@ impl SessionManager {
 		.await?;
 		guard.session = Some(SessionState::Initialized(session));
 
-		spawn_session_watchdog(&self.inner, &mut guard);
+		cancellation.disarm();
 		tracing::info!("Session initialized successfully, waiting to be launched.");
 
 		// Set the keys sender here so that it is not set if session initialization failed.
@@ -311,10 +318,14 @@ impl SessionManager {
 
 	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
 	pub async fn launch_session(&self) -> Result<(), ()> {
-		let session = {
+		let (session, processes) = {
 			let mut guard = self.inner.lock().await;
+			let processes = guard.processes.clone().ok_or(())?;
+			if processes.group().is_stopping() {
+				return Err(());
+			}
 			match guard.session.take() {
-				Some(SessionState::Initialized(session)) => session,
+				Some(SessionState::Initialized(session)) => (session, processes),
 				Some(SessionState::Launched(launched)) => {
 					guard.session = Some(SessionState::Launched(launched));
 					tracing::warn!("LaunchSession rejected: session already launched");
@@ -332,18 +343,21 @@ impl SessionManager {
 			}
 		};
 
+		let mut cancellation = CleanupOnDrop::new(processes.clone());
 		tracing::info!("Launching session (starting compositor and app).");
-		match session.launch().await {
+		match session.launch(processes.group()).await {
 			Ok(launched) => {
 				let mut guard = self.inner.lock().await;
+				if processes.group().is_stopping() || !same_session(&guard, &processes) {
+					return Err(());
+				}
 				guard.session = Some(SessionState::Launched(launched));
+				cancellation.disarm();
 				tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
 				Ok(())
 			},
 			Err(()) => {
-				let mut guard = self.inner.lock().await;
-				guard.reset_session();
-				tracing::error!("Failed to launch session, waiting for new session.");
+				tracing::error!("Failed to launch session; cleaning up its process subtree.");
 				Err(())
 			},
 		}
@@ -354,14 +368,22 @@ impl SessionManager {
 	/// Returns `Ok(())` only after all three streams (video, audio, control) are
 	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
 	pub async fn start_session(&self) -> Result<(), ()> {
-		let (launched, video_stream_context, audio_stream_context, stop) = {
+		let (launched, video_stream_context, audio_stream_context, stop, processes) = {
 			let mut guard = self.inner.lock().await;
+			let processes = guard.processes.clone().ok_or(())?;
+			if processes.group().is_stopping() {
+				return Err(());
+			}
 			let video_stream_context = guard.video_stream_context.take();
 			let audio_stream_context = guard.audio_stream_context.take();
 			match guard.session.take() {
-				Some(SessionState::Launched(launched)) => {
-					(launched, video_stream_context, audio_stream_context, guard.stop.clone())
-				},
+				Some(SessionState::Launched(launched)) => (
+					launched,
+					video_stream_context,
+					audio_stream_context,
+					guard.stop.clone(),
+					processes,
+				),
 				Some(SessionState::Initialized(session)) => {
 					guard.session = Some(SessionState::Initialized(session));
 					tracing::warn!("StartSession rejected: session not yet launched");
@@ -388,6 +410,7 @@ impl SessionManager {
 			}
 		};
 
+		let mut cancellation = CleanupOnDrop::new(processes.clone());
 		let video_stream_context = video_stream_context.ok_or_else(|| {
 			tracing::error!("VideoStreamContext not set");
 		})?;
@@ -411,14 +434,17 @@ impl SessionManager {
 			.await
 		{
 			Ok((active, video_notify, audio_notify)) => {
+				if processes.group().is_stopping() || !same_session(&guard, &processes) {
+					return Err(());
+				}
+				cancellation.disarm();
 				guard.session = Some(SessionState::Active(active));
 				guard.video_start_notify = Some(video_notify);
 				guard.audio_start_notify = Some(audio_notify);
 				Ok(())
 			},
 			Err(()) => {
-				guard.reset_session();
-				tracing::error!("Failed to start session streams.");
+				tracing::error!("Failed to start session streams; cleaning up its process subtree.");
 				Err(())
 			},
 		}
@@ -426,25 +452,23 @@ impl SessionManager {
 
 	/// Stop the session and return to Uninitialized state.
 	pub async fn stop_session(&self) -> Result<(), ()> {
-		let (stop, shutdown) = {
-			let mut guard = self.inner.lock().await;
-			match guard.session {
-				Some(_) => {},
-				None => return Ok(()),
-			}
-			let stop = guard.stop.clone();
-			let shutdown = guard.shutdown.clone();
-
-			// Drop session first, which drops the Application.
-			guard.reset_session();
-			(stop, shutdown)
+		let (processes, stop, shutdown) = {
+			let guard = self.inner.lock().await;
+			let Some(processes) = guard.processes.clone() else {
+				return Ok(());
+			};
+			(processes, guard.stop.clone(), guard.shutdown.clone())
 		};
 
-		// Then trigger shutdown of the compositor & streams.
-		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
-
+		// This handle exists during launch too. Its supervisor keeps running if
+		// this request is cancelled, and holds the server shutdown delay token.
+		processes.shutdown(SessionShutdownReason::UserStopped).await?;
 		wait_for_session_shutdown(&stop, &shutdown, SESSION_SHUTDOWN_TIMEOUT_SECS).await?;
-		tracing::info!("Session stopped by user, waiting for new session.");
+		let mut guard = self.inner.lock().await;
+		if same_session(&guard, &processes) {
+			guard.reset_session();
+		}
+		tracing::info!("Session stopped by user; process subtree is empty.");
 		Ok(())
 	}
 
@@ -452,7 +476,7 @@ impl SessionManager {
 	pub(crate) async fn update_keys(&self, keys: SessionKeyData) -> Result<(), ()> {
 		let guard = self.inner.lock().await;
 
-		if guard.stop.is_shutdown_triggered() {
+		if guard.stop.is_shutdown_triggered() || guard.processes.as_ref().is_some_and(|p| p.group().is_stopping()) {
 			tracing::warn!("Session is shutting down; rejecting resume key update.");
 			return Err(());
 		}
@@ -473,40 +497,61 @@ impl SessionManager {
 	}
 }
 
-/// Spawn a watchdog task to monitor the session for unexpected shutdowns.
-fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut SessionManagerInner) {
-	if guard.stop_watcher.is_some() {
-		tracing::error!("Session watchdog already running, not spawning another.");
-		return;
-	}
+/// Requests cleanup when an initialization/launch/start future fails or is
+/// cancelled. The manager retains ownership until the supervisor finishes.
+struct CleanupOnDrop(Option<Arc<SessionProcesses>>);
 
-	let inner = inner.clone();
+impl CleanupOnDrop {
+	fn new(processes: Arc<SessionProcesses>) -> Self {
+		Self(Some(processes))
+	}
+	fn disarm(&mut self) {
+		self.0 = None;
+	}
+}
+
+impl Drop for CleanupOnDrop {
+	fn drop(&mut self) {
+		if let Some(processes) = &self.0 {
+			processes.request_stop(SessionShutdownReason::UserStopped);
+		}
+	}
+}
+
+fn same_session(guard: &SessionManagerInner, processes: &Arc<SessionProcesses>) -> bool {
+	guard
+		.processes
+		.as_ref()
+		.is_some_and(|current| Arc::ptr_eq(current, processes))
+}
+
+/// Release the session slot only after external processes and in-process tasks
+/// have finished. The weak reference avoids keeping the manager alive forever.
+fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut SessionManagerInner) {
+	let inner = Arc::downgrade(inner);
+	let processes = guard
+		.processes
+		.clone()
+		.expect("Process owner installed before watchdog");
 	let stop = guard.stop.clone();
 	let shutdown = guard.shutdown.clone();
-	let handle = tokio::spawn(async move {
-		tokio::select! {
-			reason = stop.wait_shutdown_triggered() => {
-				if reason == SessionShutdownReason::UserStopped {
-					tracing::info!("Session shutdown requested by user.");
-				} else {
-					tracing::warn!("Session stopped unexpectedly (reason: {reason:?}), waiting for new session.");
-				}
-			},
-			_ = shutdown.wait_shutdown_triggered() => {
-				tracing::debug!("Global shutdown triggered, stopping active session.");
-				let _ = stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
-			},
+	guard.stop_watcher = Some(tokio::spawn(async move {
+		if processes.wait().await.is_err() {
+			return;
 		}
-
-		// First drop the session so that the application exits as soon as possible.
+		if wait_for_session_shutdown(&stop, &shutdown, SESSION_SHUTDOWN_TIMEOUT_SECS)
+			.await
+			.is_err()
 		{
-			inner.lock().await.reset_session();
+			return;
 		}
-
-		// Then wait for the session to shut down.
-		stop.wait_shutdown_complete().await;
-	});
-	guard.stop_watcher = Some(handle);
+		if let Some(inner) = inner.upgrade() {
+			let mut guard = inner.lock().await;
+			if same_session(&guard, &processes) {
+				guard.reset_session();
+			}
+		}
+	}));
 }
 
 /// Wait for the session to shut down within the given timeout.
@@ -532,3 +577,6 @@ async fn wait_for_session_shutdown(
 		},
 	}
 }
+
+#[cfg(test)]
+mod process_lifecycle_tests;

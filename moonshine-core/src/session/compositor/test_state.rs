@@ -96,6 +96,8 @@ impl MoonshineCompositor {
 			color_management: None,
 			deferred_info_done: vec![],
 			xwayland_shell_state,
+			xwayland_source: None,
+			xwayland_stopping: false,
 			xwm: None,
 			xdisplay: None,
 			xdisplay_tx: None,

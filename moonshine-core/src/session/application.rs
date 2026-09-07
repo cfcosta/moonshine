@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use super::processes::ProcessGroup;
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
@@ -83,9 +86,6 @@ const PROPERTIES_CHANGED: &str = "PropertiesChanged";
 const UNIT_INTERFACE: &str = "org.freedesktop.systemd1.Unit";
 const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 
-const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2);
-const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Start-job wait (includes `ExecStartPre`), decoupled from `launch_timeout_secs` so a `pre_command` isn't cut off.
 const START_JOB_TIMEOUT: Duration = Duration::from_secs(90);
 
@@ -104,6 +104,7 @@ async fn subscribe_to_systemd_signals(conn: &Connection) -> Result<(), ()> {
 #[derive(Clone)]
 pub(crate) struct LaunchOptions<'a> {
 	pub unit_name: &'a str,
+	pub group: &'a ProcessGroup,
 	pub program: &'a str,
 	pub args: &'a [String],
 	pub envs: &'a [String],
@@ -116,8 +117,8 @@ pub(crate) struct LaunchOptions<'a> {
 
 /// Runtime context required to launch an application.
 pub(crate) struct ApplicationContext {
-	/// systemd transient unit name (e.g. `"moonshine-session.service"`).
-	pub unit_name: String,
+	/// Process subtree owned by this session.
+	pub group: Arc<ProcessGroup>,
 	/// Path to the PulseAudio socket created by the audio stream.
 	pub pulse_socket_path: PathBuf,
 	/// X11 display number reported by XWayland (e.g. `0` → `":0"`).
@@ -131,7 +132,6 @@ pub(crate) struct ApplicationContext {
 }
 
 pub(crate) struct Application {
-	unit_name: String,
 	config: ApplicationConfig,
 	exit_monitor: Option<JoinHandle<()>>,
 }
@@ -142,6 +142,9 @@ impl Application {
 		context: ApplicationContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
+		if context.group.is_stopping() {
+			return Err(());
+		}
 		let Some(program) = config.command.first() else {
 			tracing::error!("Application command is empty.");
 			return Err(());
@@ -157,12 +160,10 @@ impl Application {
 			.map_err(|e| tracing::error!("Failed to connect to session bus: {e}"))?;
 		subscribe_to_systemd_signals(&conn).await?;
 
-		// Stop any leftover unit from a previous session.
-		let _ = stop_unit(&conn, &context.unit_name).await;
-
 		// Launch the application as a transient systemd service unit.
 		let options = LaunchOptions {
-			unit_name: &context.unit_name,
+			unit_name: &context.group.application_unit,
+			group: &context.group,
 			program,
 			args,
 			envs: &envs,
@@ -173,18 +174,13 @@ impl Application {
 			stderr_value: &config.stderr,
 		};
 
-		let unit_path = match start_transient_service(&conn, &options).await {
-			Ok(unit_path) => unit_path,
-			Err(_) => {
-				// Best effort cleanup on launch failure.
-				stop_unit(&conn, &context.unit_name).await.ok();
-				return Err(());
-			},
-		};
-		let exit_monitor = spawn_unit_exit_monitor(conn.clone(), context.unit_name.clone(), unit_path, stop);
+		// The session supervisor already owns the unit name, including when this
+		// future is cancelled before StartTransientUnit returns.
+		let unit_path = start_transient_service(&conn, &options).await?;
+		let exit_monitor =
+			spawn_unit_exit_monitor(conn.clone(), context.group.application_unit.clone(), unit_path, stop);
 
 		Ok(Self {
-			unit_name: context.unit_name,
 			config,
 			exit_monitor: Some(exit_monitor),
 		})
@@ -198,14 +194,7 @@ impl Drop for Application {
 			handle.abort();
 		}
 
-		// Unfortunately we have no `drop_async` yet, so we must spawn an async runtime to call stop_unit.
-		let unit_name = self.unit_name.clone();
-		std::thread::spawn(move || {
-			let rt = tokio::runtime::Runtime::new().unwrap();
-			rt.block_on(stop_unit_owned(unit_name)).ok();
-		})
-		.join()
-		.unwrap();
+		// Process termination belongs to the session supervisor, which awaits it.
 	}
 }
 
@@ -292,94 +281,6 @@ async fn wait_for_job_signal(
 			Err(())
 		},
 	}
-}
-
-/// Stop a unit via the user session bus.
-///
-/// Waits for the stop job to complete and the unit to be removed, with a timeout.
-async fn stop_unit(conn: &Connection, unit_name: &str) -> Result<(), ()> {
-	// Subscribe to both JobRemoved and UnitRemoved before calling StopUnit to avoid races.
-	let proxy = Proxy::new(conn, SYSTEMD_BUS, SYSTEMD_PATH, SYSTEMD_MANAGER)
-		.await
-		.map_err(|e| tracing::error!("Failed to create systemd proxy: {e}"))?;
-	let mut job_removed_stream = proxy
-		.receive_signal("JobRemoved")
-		.await
-		.map_err(|e| tracing::error!("Failed to subscribe to JobRemoved signals: {e}"))?;
-	let mut unit_removed_stream = proxy
-		.receive_signal("UnitRemoved")
-		.await
-		.map_err(|e| tracing::error!("Failed to subscribe to UnitRemoved signals: {e}"))?;
-
-	// Call StopUnit, which queues a stop job but does not wait for it to complete.
-	let reply = conn
-		.call_method(
-			Some(SYSTEMD_BUS),
-			SYSTEMD_PATH,
-			Some(SYSTEMD_MANAGER),
-			"StopUnit",
-			&(unit_name, "replace"),
-		)
-		.await
-		.map_err(|e| match e {
-			zbus::Error::MethodError(ref err_name, ..)
-				if err_name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
-			{
-				tracing::debug!("Unit was already stopped.");
-			},
-			e => {
-				tracing::error!("Failed to get unit: {e}");
-			},
-		})?;
-
-	let job_path = reply
-		.body()
-		.deserialize()
-		.map_err(|e| tracing::warn!("Failed to deserialize StopUnit reply for {unit_name}: {e}"))?;
-
-	// Wait for JobRemoved with result "done" — the stop job completed.
-	wait_for_job_signal(&mut job_removed_stream, &job_path, STOP_JOB_TIMEOUT, "Stop").await?;
-
-	// Stop job succeeded — wait for the unit to be collected and removed.
-	let unit_result = tokio::time::timeout(UNIT_REMOVED_TIMEOUT, async {
-		while let Some(message) = unit_removed_stream.next().await {
-			let (id, _path): (String, OwnedObjectPath) = message
-				.body()
-				.deserialize()
-				.map_err(|e| tracing::error!("Failed to deserialize UnitRemoved signal: {e}"))?;
-
-			if id == unit_name {
-				return Ok(());
-			}
-		}
-		Err(())
-	})
-	.await;
-
-	match unit_result {
-		Ok(Ok(())) => {
-			tracing::debug!("Leftover unit {unit_name} stopped and unloaded.");
-			Ok(())
-		},
-		Ok(Err(())) => Err(()),
-		Err(_) => {
-			tracing::warn!(
-				timeout_secs = UNIT_REMOVED_TIMEOUT.as_secs(),
-				unit = unit_name,
-				"Timed out waiting for leftover unit to be removed."
-			);
-			Err(())
-		},
-	}
-}
-
-/// Stop a unit with a new session bus connection.
-async fn stop_unit_owned(unit_name: String) -> Result<(), ()> {
-	let conn = Connection::session().await.map_err(|e| {
-		tracing::error!("Failed to connect to session bus: {e}");
-	})?;
-	subscribe_to_systemd_signals(&conn).await?;
-	stop_unit(&conn, &unit_name).await
 }
 
 fn spawn_unit_exit_monitor(
@@ -570,7 +471,22 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 	// (array of variant). Build typed arrays with Array::new(signature) + append() instead.
 	let mut properties: Vec<(String, zvariant::Value<'_>)> = vec![
 		("Type".to_string(), zvariant::Value::Str("exec".into())),
-		("Slice".to_string(), zvariant::Value::Str("moonshine.slice".into())),
+		("Slice".to_string(), zvariant::Value::from(options.group.slice.as_str())),
+		("ExitType".to_string(), zvariant::Value::from("cgroup")),
+		("KillMode".to_string(), zvariant::Value::from("control-group")),
+		// Keep systemd escalation enabled as a fallback if the daemon crashes.
+		("SendSIGKILL".to_string(), zvariant::Value::from(true)),
+		(
+			"Requisite".to_string(),
+			zvariant::Value::from(vec![options.group.gate_unit.as_str()]),
+		),
+		(
+			"After".to_string(),
+			zvariant::Value::from(vec![
+				options.group.gate_unit.as_str(),
+				options.group.xwayland_unit.as_str(),
+			]),
+		),
 		// Environment: as
 		("Environment".to_string(), zvariant::Value::from(options.envs.to_vec())),
 		// ExecStart: a(sasb)
@@ -624,7 +540,7 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 			SYSTEMD_PATH,
 			Some(SYSTEMD_MANAGER),
 			"StartTransientUnit",
-			&(options.unit_name, "replace", &properties, &aux),
+			&(options.unit_name, "fail", &properties, &aux),
 		)
 		.await
 		.map_err(|e| tracing::warn!("Failed to start transient service: {e}"))?;

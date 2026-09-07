@@ -17,7 +17,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 ## Requirements
 
 1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for SteamOS. Tested on Arch Linux, but reported to work on other distributions too.
-1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
+1. **systemd 254 or newer, with cgroup v2**. Required for launching and managing session processes. `systemd-run`, `sh`, `cat`, `true`, and `Xwayland` must be available on Moonshine's `PATH`.
 1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
 

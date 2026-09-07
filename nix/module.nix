@@ -193,12 +193,17 @@ in
       description = "Moonshine game streaming server (Moonlight protocol)";
       wantedBy = [ "multi-user.target" ];
       # The user manager owns the runtime dir, session bus, and the transient
-      # units moonshine launches apps as (moonshine-session.service).
+      # units Moonshine uses for each session's application and Xwayland.
       requires = [ "user@${toString cfg.uid}.service" ];
       after = [ "user@${toString cfg.uid}.service" ];
       # The compositor spawns Xwayland (X11 games, i.e. most of Steam, run
       # under it) from the unit's PATH.
-      path = [ pkgs.xwayland ];
+      path = [
+        pkgs.xwayland
+        pkgs.systemd
+        pkgs.bash
+        pkgs.coreutils
+      ];
       environment = {
         MOONSHINE_LOG = cfg.logFilter;
         # What the user manager would have provided, set by hand as in

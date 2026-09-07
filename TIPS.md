@@ -184,10 +184,14 @@ stderr = "journal"
 After a failed run, inspect the logs for the session's unit:
 
 ```
-journalctl --user -u moonshine-session.service
+journalctl --user -u 'moonshine-app-*.service'
 ```
 
 You can also add `-e` to jump to the end of the log and `-f` to follow it live while retrying the launch.
+
+Each launch has a unique unit name, printed in Moonshine's logs. Use that full
+name to inspect one particular session. Its application and Xwayland processes
+are grouped under `moonshine-session-<id>.slice`.
 
 ### Details
 

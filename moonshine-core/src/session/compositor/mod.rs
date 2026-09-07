@@ -163,7 +163,8 @@ impl Compositor {
 		)
 	}
 
-	pub fn launch(self) -> Result<LaunchedCompositor, ()> {
+	pub fn launch(self, group: std::sync::Arc<super::processes::ProcessGroup>) -> Result<LaunchedCompositor, ()> {
+		let processes = group.begin_compositor()?;
 		let Self {
 			config,
 			context,
@@ -177,7 +178,7 @@ impl Compositor {
 		std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
-				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, ready_tx, stop) {
+				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, ready_tx, stop, processes) {
 					tracing::error!("Compositor failed: {e}");
 				}
 			})
@@ -210,7 +211,9 @@ fn run_compositor(
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	ready_tx: mpsc::SyncSender<CompositorReady>,
 	stop: ShutdownManager<SessionShutdownReason>,
+	processes: super::processes::CompositorProcessGuard,
 ) -> Result<(), String> {
+	let group = &processes.group;
 	// Trigger session shutdown if the compositor exits unexpectedly.
 	let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::CompositorStopped);
 	let _delay_stop = stop.delay_shutdown_token();
@@ -475,7 +478,10 @@ fn run_compositor(
 	// source fires (frame timer, input channel, or Wayland client event).
 	// A hard timeout like 16ms would compete with the frame timer cadence.
 	let mut state = state;
-	state.start_xwayland();
+	if stop.is_shutdown_triggered() || group.is_stopping() {
+		return Ok(());
+	}
+	state.start_xwayland(group)?;
 
 	tracing::debug!(
 		shutdown_triggered = stop.is_shutdown_triggered(),
@@ -483,16 +489,17 @@ fn run_compositor(
 	);
 
 	while !stop.is_shutdown_triggered() {
+		if group.is_stopping() {
+			state.release_x11_focus();
+			processes.release_x11();
+		}
 		event_loop
 			.dispatch(None, &mut state)
 			.map_err(|e| format!("Event loop dispatch error: {e}"))?;
 	}
 
-	// Stop the application first so X11 clients disconnect from
-	// Xwayland, then tear down the X11 window manager. When the event
-	// loop is dropped afterwards, Smithay's XWayland::Drop disconnects
-	// the Wayland client, and the `-terminate` flag causes Xwayland to
-	// exit.
+	// External process termination is owned by the session supervisor.
+	// Release Smithay's Xwayland source explicitly as well as its connections.
 	state.shutdown_session_processes();
 
 	tracing::info!("Compositor stopped.");

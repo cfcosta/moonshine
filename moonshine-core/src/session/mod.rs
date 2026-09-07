@@ -23,6 +23,7 @@ use self::compositor::Compositor;
 use self::compositor::LaunchedCompositor;
 use self::compositor::frame::HdrModeState;
 use self::inhibit::SleepInhibitor;
+use self::processes::ProcessGroup;
 use self::stream::audio::AudioStreamConfig;
 use self::stream::control::ControlStreamConfig;
 use self::stream::video::VideoStreamConfig;
@@ -31,6 +32,7 @@ pub mod application;
 pub mod compositor;
 pub mod inhibit;
 pub mod manager;
+mod processes;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
@@ -184,7 +186,7 @@ impl InitializedSession {
 	}
 
 	/// Launch the session — starts the compositor and application, but does not start streams.
-	pub(crate) async fn launch(self) -> Result<LaunchedSession, ()> {
+	pub(crate) async fn launch(self, group: Arc<ProcessGroup>) -> Result<LaunchedSession, ()> {
 		let Self {
 			context,
 			compositor,
@@ -195,14 +197,17 @@ impl InitializedSession {
 			stop,
 		} = self;
 
-		let launched_compositor = compositor.launch()?;
+		if group.is_stopping() {
+			return Err(());
+		}
+		let launched_compositor = compositor.launch(group.clone())?;
 		let ready = launched_compositor.ready();
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
 		let application = Application::spawn(
 			context.application.clone(),
 			ApplicationContext {
-				unit_name: "moonshine-session.service".to_string(),
+				group,
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),

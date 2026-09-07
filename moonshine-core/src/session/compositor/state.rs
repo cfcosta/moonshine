@@ -292,6 +292,8 @@ pub(crate) struct MoonshineCompositor {
 
 	// -- XWayland --
 	pub xwayland_shell_state: XWaylandShellState,
+	pub xwayland_source: Option<calloop::RegistrationToken>,
+	pub xwayland_stopping: bool,
 	pub xwm: Option<X11Wm>,
 	pub xdisplay: Option<u32>,
 	/// Channel to notify the session thread of the XWayland display number
@@ -627,6 +629,8 @@ impl MoonshineCompositor {
 				color_management,
 				deferred_info_done: Vec::new(),
 				xwayland_shell_state,
+				xwayland_source: None,
+				xwayland_stopping: false,
 				xwm: None,
 				xdisplay: None,
 				xdisplay_tx: Some(xdisplay_tx),
@@ -1432,7 +1436,7 @@ impl MoonshineCompositor {
 	/// Spawns the XWayland process and registers it as a calloop
 	/// event source. When XWayland signals readiness, the X11 window
 	/// manager is started and DISPLAY is set for child processes.
-	pub fn start_xwayland(&mut self) {
+	pub fn start_xwayland(&mut self, group: &crate::session::processes::ProcessGroup) -> Result<(), String> {
 		use smithay::wayland::compositor::CompositorHandler;
 		use smithay::xwayland::{XWayland, XWaylandEvent};
 
@@ -1453,12 +1457,20 @@ impl MoonshineCompositor {
 			"Spawning XWayland"
 		);
 
+		let mut envs = vec![(
+			std::ffi::OsString::from("PATH"),
+			group.xwayland_path().map_err(|_| "Invalid Xwayland PATH")?,
+		)];
+		if let Some(address) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+			envs.push(("DBUS_SESSION_BUS_ADDRESS".into(), address));
+		}
+		if std::env::var_os("MOONSHINE_WAYLAND_DEBUG").is_some() {
+			envs.push(("WAYLAND_DEBUG".into(), "1".into()));
+		}
 		let (xwayland, client) = match XWayland::spawn(
 			&self.display_handle,
 			None,
-			std::env::var("MOONSHINE_WAYLAND_DEBUG")
-				.ok()
-				.map(|_| ("WAYLAND_DEBUG", "1")),
+			envs,
 			true,
 			xwayland_log_stdout,
 			xwayland_log_stderr,
@@ -1466,8 +1478,7 @@ impl MoonshineCompositor {
 		) {
 			Ok(result) => result,
 			Err(e) => {
-				tracing::error!("Failed to spawn XWayland: {e}");
-				return;
+				return Err(format!("Failed to spawn XWayland: {e}"));
 			},
 		};
 		tracing::debug!(
@@ -1500,7 +1511,7 @@ impl MoonshineCompositor {
 
 					// Open an X11 connection to the XWayland display for
 					// reading root window properties (Steam focus control).
-					if data.x11_focus.is_none() {
+					if data.x11_focus.is_none() && !data.xwayland_stopping {
 						data.x11_focus = super::x11_focus::X11Focus::open(display_number);
 					}
 
@@ -1518,32 +1529,37 @@ impl MoonshineCompositor {
 				},
 			});
 
-		if let Err(e) = ret {
-			tracing::error!("Failed to insert XWayland source into event loop: {e}");
-		}
+		self.xwayland_source = Some(ret.map_err(|e| format!("Failed to insert XWayland source into event loop: {e}"))?);
+		Ok(())
 	}
 
 	/// Shut down XWayland server connections.
 	///
-	/// Drops the X11 window manager connection so Xwayland sees no remaining
-	/// connections and exits. The application's systemd scope is stopped by
-	/// `Application::Drop` after the compositor thread has exited.
+	/// Release the X11 and Wayland connections and the Xwayland event source.
+	/// The session supervisor independently stops and verifies the process subtree.
 	pub fn shutdown_session_processes(&mut self) {
 		if let Some(token) = self.wayland_socket_token.take() {
 			self.handle.remove(token);
 			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
 		}
 
-		// Clear the X11 focus control connection so reevaluate_focus
-		// can't read from a dead X11 display during cleanup.
-		if self.x11_focus.take().is_some() {
-			tracing::debug!("Cleared X11 focus control connection");
-		}
+		self.release_x11_focus();
 
 		// Drop the X11 window manager, closing the privileged WM
 		// connection to Xwayland. Xwayland will see no remaining connections.
 		if self.xwm.take().is_some() {
 			tracing::debug!("Dropped X11 window manager");
+		}
+		if let Some(token) = self.xwayland_source.take() {
+			self.handle.remove(token);
+		}
+	}
+	/// Close Xlib while its server is still alive; otherwise Xlib may terminate
+	/// the entire daemon on an I/O error. Do not reopen it during late readiness.
+	pub fn release_x11_focus(&mut self) {
+		self.xwayland_stopping = true;
+		if self.x11_focus.take().is_some() {
+			tracing::debug!("Cleared X11 focus control connection");
 		}
 	}
 }
