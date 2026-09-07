@@ -14,3 +14,6 @@ async-shutdown = "0.2.2"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hdrhistogram = { version = "7", default-features = false }

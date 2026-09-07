@@ -80,7 +80,7 @@ impl MoonshineCompositor {
 		});
 		if !valid {
 			let _ = PopupManager::dismiss_popup(&root, &kind);
-			self.screen_dirty = true;
+			self.mark_scene_dirty();
 			return;
 		}
 		let parent = popup.get_parent_surface().expect("validated popup root");
@@ -89,7 +89,7 @@ impl MoonshineCompositor {
 			// A submenu request can already be in flight when its grabbing
 			// parent is dismissed. Dismiss it as well, without killing the client.
 			let _ = PopupManager::dismiss_popup(&root, &kind);
-			self.screen_dirty = true;
+			self.mark_scene_dirty();
 			return;
 		}
 		let current = self
@@ -164,7 +164,7 @@ impl MoonshineCompositor {
 				let _ = PopupManager::dismiss_popup(&root, &popup);
 			}
 		}
-		self.screen_dirty = true;
+		self.mark_scene_dirty();
 		self.reconcile_popup_grab();
 	}
 
@@ -212,7 +212,7 @@ impl MoonshineCompositor {
 			}
 		}
 		let _ = PopupManager::dismiss_popup(root, popup);
-		self.screen_dirty = true;
+		self.mark_scene_dirty();
 	}
 
 	/// Reconcile immediately, not on the next input event: a client may close
@@ -224,7 +224,7 @@ impl MoonshineCompositor {
 		let focus = grab.current_grab().filter(IsAlive::alive);
 		if ended {
 			self.popup_grab = None;
-			self.screen_dirty = true;
+			self.mark_scene_dirty();
 			if let Some(keyboard) = self.seat.get_keyboard()
 				&& keyboard
 					.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<Self>>())

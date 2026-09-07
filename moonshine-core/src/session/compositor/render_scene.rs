@@ -73,8 +73,10 @@ impl MoonshineCompositor {
 
 	/// Whether cursor and popup visibility allow either single-buffer scanout path.
 	pub(super) fn can_direct_scanout_scene(&self) -> bool {
-		self.last_pointer_activity
-			.is_none_or(|time| time.elapsed() > std::time::Duration::from_secs(3))
+		self.allow_direct_scanout
+			&& self
+				.last_pointer_activity
+				.is_none_or(|time| time.elapsed() > std::time::Duration::from_secs(3))
 			&& self.popup_surfaces_for_render().is_empty()
 	}
 

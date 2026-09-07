@@ -79,7 +79,7 @@ impl TouchGrab<MoonshineCompositor> for PopupTouchGrab {
 			// The other seat grabs are reconciled by the compositor once this
 			// handler returns and the touch mutex has been released.
 			self.popup_grab.ungrab(PopupUngrabStrategy::All);
-			data.screen_dirty = true;
+			data.mark_scene_dirty();
 			handle.unset_grab(self, data);
 			DefaultGrab.down(data, handle, focus, event, seq);
 		}

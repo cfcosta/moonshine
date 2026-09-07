@@ -19,6 +19,15 @@ fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
 		.max(1)
 }
 
+/// Outcome of all send attempts for one frame.
+#[derive(Default, Debug)]
+pub(crate) struct SendReport {
+	pub fallback_chunks: u64,
+	pub errors: u64,
+	pub datagrams: u64,
+	pub bytes: u64,
+}
+
 /// UDP socket for the video stream, with Generic Segmentation Offload.
 ///
 /// Wraps a `tokio::net::UdpSocket` and quinn-udp's `UdpSocketState` so shard
@@ -64,17 +73,18 @@ impl UdpGsoSocket {
 
 	/// Send a shard batch to `addr`.
 	///
-	/// Returns the number of chunks that fell back to per-shard sends because
-	/// the kernel rejected the GSO send (0 on success).
+	/// Reports successful bytes/datagrams, final send errors, and GSO fallbacks.
 	///
 	/// GSO availability is re-checked on every call: quinn-udp disables it at
 	/// runtime if the kernel or NIC rejects a segmented send.
-	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
+	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> SendReport {
 		if self.udp_state.max_gso_segments() > 1 {
 			self.send_batch_gso(batch, addr).await
 		} else {
-			self.send_shards(batch.as_bytes(), batch.shard_size(), addr).await;
-			0
+			let mut report = SendReport::default();
+			self.send_shards(batch.as_bytes(), batch.shard_size(), addr, &mut report)
+				.await;
+			report
 		}
 	}
 
@@ -82,14 +92,14 @@ impl UdpGsoSocket {
 	/// caps; a frame's batch routinely exceeds both. Uses `try_send` because
 	/// `send` masks every error except `WouldBlock` as success, silently
 	/// discarding the batch.
-	async fn send_batch_gso(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
+	async fn send_batch_gso(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> SendReport {
 		let shard_size = batch.shard_size();
 		if shard_size == 0 {
-			return 0;
+			return SendReport::default();
 		}
 		let segments_per_send = gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size);
 
-		let mut failed_chunks = 0u32;
+		let mut report = SendReport::default();
 		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
 			let transmit = Transmit {
 				destination: addr,
@@ -109,22 +119,32 @@ impl UdpGsoSocket {
 				}
 			};
 			if let Err(e) = result {
-				failed_chunks += 1;
+				report.fallback_chunks += 1;
 				tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
-				self.send_shards(chunk, shard_size, addr).await;
+				self.send_shards(chunk, shard_size, addr, &mut report).await;
+			} else {
+				report.datagrams += (chunk.len() / shard_size) as u64;
+				report.bytes += chunk.len() as u64;
 			}
 		}
-		failed_chunks
+		report
 	}
 
 	/// Send a contiguous buffer of equal-sized shards as individual UDP packets.
-	async fn send_shards(&self, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) {
+	async fn send_shards(&self, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr, report: &mut SendReport) {
 		if shard_size == 0 {
 			return;
 		}
 		for shard in bytes.chunks(shard_size) {
-			if let Err(e) = self.socket.send_to(shard, addr).await {
-				tracing::warn!("Failed to send packet to client: {e}");
+			match self.socket.send_to(shard, addr).await {
+				Ok(n) => {
+					report.datagrams += 1;
+					report.bytes += n as u64;
+				},
+				Err(e) => {
+					report.errors += 1;
+					tracing::warn!("Failed to send packet to client: {e}");
+				},
 			}
 		}
 	}
@@ -133,6 +153,31 @@ impl UdpGsoSocket {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn send_report_matches_real_received_datagrams() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let mut shards = crate::session::stream::video::shard_batch::ShardBuf::new(3, 64, 0);
+		for index in 0..3 {
+			shards.shard_mut(index)[0] = index as u8;
+		}
+		let report = socket
+			.send_batch(&shards.into_batch(), receiver.local_addr().unwrap())
+			.await;
+		assert_eq!(report.errors, 0);
+		assert_eq!(report.datagrams, 3);
+		assert_eq!(report.bytes, 192);
+		for index in 0..3 {
+			let mut bytes = [0; 128];
+			let (len, _) = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv_from(&mut bytes))
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(len, 64);
+			assert_eq!(bytes[0], index);
+		}
+	}
 
 	#[test]
 	fn gso_segment_count_cap_binds() {

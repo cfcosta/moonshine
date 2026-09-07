@@ -95,6 +95,30 @@ impl HdrMetadata {
 	}
 }
 
+/// Capture-side timing carried through every pipeline stage.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureTiming {
+	pub started_at: Instant,
+	/// Applied attachment of the selected direct-capture buffer until capture.
+	pub buffer_age: Option<std::time::Duration>,
+	pub scene_wait: Option<std::time::Duration>,
+	pub timer_lateness: std::time::Duration,
+	pub render_wait: std::time::Duration,
+	pub path: crate::session::stream::video::CapturePath,
+}
+impl Default for CaptureTiming {
+	fn default() -> Self {
+		Self {
+			started_at: Instant::now(),
+			scene_wait: None,
+			buffer_age: None,
+			timer_lateness: std::time::Duration::ZERO,
+			render_wait: std::time::Duration::ZERO,
+			path: Default::default(),
+		}
+	}
+}
+
 /// A compositor frame exported for encoding.
 ///
 /// Plane file descriptors are borrowed references to the compositor's
@@ -103,6 +127,7 @@ impl HdrMetadata {
 /// compositor from recycling a buffer before the encoder finishes reading.
 #[derive(Debug, Clone)]
 pub(crate) struct ExportedFrame {
+	pub timing: CaptureTiming,
 	/// Per-plane DMA-BUF metadata.
 	pub planes: Vec<ExportedPlane>,
 	/// DRM format (e.g. Argb8888, Abgr2101010).

@@ -50,8 +50,13 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
 use super::KeyboardConfig;
+use super::frame::CaptureTiming;
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
 use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
+use crate::session::stream::video::{
+	CapturePath,
+	metrics::{Counter, VideoDiagnostics},
+};
 
 /// Number of pre-allocated GBM buffers. Three allows the compositor to
 /// always have a free buffer: at most two frames are queued in the
@@ -267,6 +272,11 @@ pub(crate) struct MoonshineCompositor {
 	/// move). Cleared after a frame is sent. When false and a frame was sent
 	/// less than 1 second ago, rendering is skipped to save GPU/CPU/bandwidth.
 	pub screen_dirty: bool,
+	pub scene_dirty_since: Option<std::time::Instant>,
+	pub timer_lateness: std::time::Duration,
+	pub capture_timing: CaptureTiming,
+	pub diagnostics: VideoDiagnostics,
+	pub allow_direct_scanout: bool,
 	/// Timestamp of the last frame that was actually sent to the encoder.
 	pub last_frame_sent_at: std::time::Instant,
 	/// Cached cursor position from the last sent frame, to detect cursor-only
@@ -621,6 +631,11 @@ impl MoonshineCompositor {
 				buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
 				render_count: 0,
 				screen_dirty: true,
+				scene_dirty_since: None,
+				timer_lateness: std::time::Duration::ZERO,
+				capture_timing: Default::default(),
+				diagnostics: Default::default(),
+				allow_direct_scanout: true,
 				last_frame_sent_at: std::time::Instant::now(),
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				viewporter_state,
@@ -658,19 +673,35 @@ impl MoonshineCompositor {
 		)
 	}
 
+	pub fn mark_scene_dirty(&mut self) {
+		self.screen_dirty = true;
+		self.scene_dirty_since.get_or_insert_with(std::time::Instant::now);
+	}
+
 	/// Render the current scene and export the frame to the encoder.
 	pub fn render_and_export(&mut self) {
+		self.diagnostics.count(Counter::CaptureTicks);
 		// Detect cursor-only movement as a screen change.
 		if self.cursor_position != self.last_cursor_position {
-			self.screen_dirty = true;
+			self.mark_scene_dirty();
 			self.last_cursor_position = self.cursor_position;
 		}
 
 		// Skip rendering when the screen is static and we already sent a
 		// keepalive frame within the last second.
 		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
+			self.diagnostics.count(Counter::StaticSkips);
 			return;
 		}
+
+		let started_at = std::time::Instant::now();
+		self.capture_timing = CaptureTiming {
+			started_at,
+			scene_wait: self.scene_dirty_since.map(|t| started_at.saturating_duration_since(t)),
+			timer_lateness: self.timer_lateness,
+			..Default::default()
+		};
+		self.diagnostics.count(Counter::CaptureAttempts);
 
 		// Release held scanout buffers that the encoder has finished reading.
 		// Drop their entries from the buffer→index map; if the same wl_buffer
@@ -714,6 +745,7 @@ impl MoonshineCompositor {
 		let idx = self.next_buffer_index;
 		let slot = &self.buffer_pool[idx];
 		if !slot.consumed.load(Ordering::Acquire) {
+			self.diagnostics.count(Counter::PoolBusy);
 			// The encoder is still reading this buffer — skip the frame
 			// to avoid overwriting its content.
 			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
@@ -743,6 +775,7 @@ impl MoonshineCompositor {
 			Ok(frame) => frame,
 			Err(e) => {
 				tracing::error!("Failed to export frame: {e}");
+				self.diagnostics.count(Counter::CaptureErrors);
 				consumed.store(true, Ordering::Release);
 				return;
 			},
@@ -766,6 +799,7 @@ impl MoonshineCompositor {
 			Ok(fb) => fb,
 			Err(e) => {
 				tracing::error!("Failed to bind Dmabuf for rendering: {e}");
+				self.diagnostics.count(Counter::CaptureErrors);
 				consumed.store(true, Ordering::Release);
 				return;
 			},
@@ -783,6 +817,7 @@ impl MoonshineCompositor {
 				Ok(elements) => elements,
 				Err(e) => {
 					tracing::error!("Failed to collect render elements: {e}");
+					self.diagnostics.count(Counter::CaptureErrors);
 					return;
 				},
 			};
@@ -841,6 +876,7 @@ impl MoonshineCompositor {
 		if override_active {
 			let Some((override_surface, _)) = self.override_surface.as_ref() else {
 				tracing::warn!("override_active but override_surface is None");
+				self.diagnostics.count(Counter::CaptureErrors);
 				return;
 			};
 			let override_elements = super::render_scene::override_render_elements(
@@ -897,6 +933,7 @@ impl MoonshineCompositor {
 			),
 			Err(e) => {
 				tracing::error!("Failed to render output: {e}");
+				self.diagnostics.count(Counter::CaptureErrors);
 				return;
 			},
 		};
@@ -907,8 +944,10 @@ impl MoonshineCompositor {
 		// Block until the render has actually completed. `finish()` only flushes
 		// the GL blit, so without waiting the encoder can read a stale buffer
 		// from the round-robin pool (frames arrive out of order).
+		let wait_started = std::time::Instant::now();
 		if let Err(e) = sync.wait() {
 			tracing::warn!("Failed to wait for render fence: {e}");
+			self.diagnostics.count(Counter::CaptureErrors);
 		}
 
 		// Update created_at to reflect the actual render completion time.
@@ -916,6 +955,8 @@ impl MoonshineCompositor {
 		// so the original timestamp is too early.
 		let mut exported_frame = exported_frame;
 		exported_frame.created_at = std::time::Instant::now();
+		exported_frame.timing = self.capture_timing.clone();
+		exported_frame.timing.render_wait = exported_frame.created_at.duration_since(wait_started);
 
 		// Send the pre-built frame to the encoder.
 		// The rendering happened after export_dmabuf duplicated the fds,
@@ -926,12 +967,15 @@ impl MoonshineCompositor {
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
 			Err(mpsc::TrySendError::Full(_)) => {
+				self.diagnostics.count(Counter::CaptureQueueFull);
 				// Channel full — release the buffer back to the pool.
 				consumed.store(true, Ordering::Release);
 			},
 			Ok(()) => {
 				// Frame accepted — reset dirty tracking.
 				self.screen_dirty = false;
+				self.scene_dirty_since = None;
+				self.diagnostics.count(Counter::CaptureExported);
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
@@ -1054,6 +1098,11 @@ impl MoonshineCompositor {
 			.collect();
 
 		let exported_frame = ExportedFrame {
+			timing: CaptureTiming {
+				path: CapturePath::Direct,
+				buffer_age: super::buffer_timing::age(&wl_surface, &buffer.id(), self.capture_timing.started_at),
+				..self.capture_timing.clone()
+			},
 			planes,
 			format: client_dmabuf.format().code as u32,
 			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
@@ -1074,10 +1123,13 @@ impl MoonshineCompositor {
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
 			Err(mpsc::TrySendError::Full(_)) => {
+				self.diagnostics.count(Counter::CaptureQueueFull);
 				consumed.store(true, Ordering::Release);
 			},
 			Ok(()) => {
 				self.screen_dirty = false;
+				self.scene_dirty_since = None;
+				self.diagnostics.count(Counter::CaptureExported);
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
@@ -1218,6 +1270,11 @@ impl MoonshineCompositor {
 			.collect();
 
 		let exported_frame = ExportedFrame {
+			timing: CaptureTiming {
+				path: CapturePath::DirectOverride,
+				buffer_age: super::buffer_timing::age(&override_surface, &buffer.id(), self.capture_timing.started_at),
+				..self.capture_timing.clone()
+			},
 			planes,
 			format: client_dmabuf.format().code as u32,
 			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
@@ -1237,10 +1294,13 @@ impl MoonshineCompositor {
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
 			Err(mpsc::TrySendError::Full(_)) => {
+				self.diagnostics.count(Counter::CaptureQueueFull);
 				consumed.store(true, Ordering::Release);
 			},
 			Ok(()) => {
 				self.screen_dirty = false;
+				self.scene_dirty_since = None;
+				self.diagnostics.count(Counter::CaptureExported);
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
@@ -1574,6 +1634,7 @@ fn export_dmabuf(
 		.collect();
 
 	Ok(ExportedFrame {
+		timing: Default::default(),
 		planes,
 		format: dmabuf.format().code as u32,
 		modifier: Into::<u64>::into(dmabuf.format().modifier),

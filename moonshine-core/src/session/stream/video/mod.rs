@@ -9,6 +9,9 @@ use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
 mod gso_socket;
+pub(crate) mod metrics;
+pub use metrics::{CapturePath, FrameStats};
+use metrics::{Counter, VideoDiagnostics};
 mod packetizer;
 mod pipeline;
 mod shard_batch;
@@ -45,35 +48,6 @@ impl Default for VideoStreamConfig {
 			log_frame_spikes: false,
 		}
 	}
-}
-
-/// Per-frame encoding statistics emitted by the video pipeline.
-///
-/// Sent via `broadcast` channel, receivable through `SessionManager::bench_stats_receiver()`.
-#[derive(Clone, Debug)]
-pub struct FrameStats {
-	/// Time the frame spent waiting in the compositor's output channel.
-	pub channel_wait: std::time::Duration,
-	/// Time spent importing the DMA-BUF into Vulkan.
-	pub import: std::time::Duration,
-	/// Time spent on GPU color conversion.
-	pub convert: std::time::Duration,
-	/// Time spent submitting the frame to the asynchronous encoder.
-	pub submit: std::time::Duration,
-	/// Time between submit completion and the packet consumer awaiting the encode future.
-	pub consumer_queue: std::time::Duration,
-	/// Time from submit completion until the asynchronous encode/readback future has resolved.
-	pub encode_wait: std::time::Duration,
-	/// Time spent packetizing the encoded data.
-	pub packetize: std::time::Duration,
-	/// Time spent sending the packets over the channel.
-	pub send: std::time::Duration,
-	/// Total end-to-end latency for this frame.
-	pub total: std::time::Duration,
-	/// Number of bytes encoded for this frame.
-	pub encoded_bytes: usize,
-	/// Whether this frame is a key (IDR) frame.
-	pub is_key_frame: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -235,11 +209,47 @@ impl VideoStreamHandle {
 	}
 }
 
+/// A frame and its timing stay together through the network queue.
+pub(crate) struct PacketFrame {
+	shards: ShardBatch,
+	stats: FrameStats,
+	enqueued_at: std::time::Instant,
+}
+
+impl PacketFrame {
+	fn complete(
+		mut self,
+		dequeued_at: std::time::Instant,
+		report: gso_socket::SendReport,
+		diagnostics: &VideoDiagnostics,
+	) {
+		let completed_at = std::time::Instant::now();
+		self.stats.completed_at = completed_at;
+		self.stats.network_queue = dequeued_at.duration_since(self.enqueued_at);
+		self.stats.network_send = completed_at.duration_since(dequeued_at);
+		self.stats.total = completed_at.duration_since(self.stats.capture_started_at);
+		self.stats.send_success = report.errors == 0;
+		self.stats.send_errors = report.errors;
+		self.stats.sent_bytes = report.bytes;
+		self.stats.sent_datagrams = report.datagrams;
+		self.stats.gso_fallback_chunks = report.fallback_chunks;
+		diagnostics.count(Counter::SendFrames);
+		if report.errors > 0 {
+			diagnostics.count(Counter::SendFailedFrames);
+		}
+		diagnostics.add(Counter::SendErrors, report.errors);
+		diagnostics.add(Counter::SendBytes, report.bytes);
+		diagnostics.add(Counter::SendDatagrams, report.datagrams);
+		diagnostics.add(Counter::GsoFallbackChunks, report.fallback_chunks);
+		diagnostics.send(self.stats);
+	}
+}
+
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
 	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
-	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	stats_tx: VideoDiagnostics,
 }
 
 impl VideoStream {
@@ -249,7 +259,7 @@ impl VideoStream {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: VideoDiagnostics,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
@@ -304,10 +314,10 @@ impl VideoStream {
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<PacketFrame>(128);
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone(), stats_tx.clone());
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -337,10 +347,11 @@ impl VideoStream {
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	mut packet_rx: mpsc::Receiver<PacketFrame>,
 	socket: UdpGsoSocket,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	diagnostics: VideoDiagnostics,
 ) {
 	tokio::spawn(async move {
 		start.notified().await;
@@ -358,7 +369,9 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some(batch)) => {
+						Ok(Some(frame)) => {
+							let dequeued_at = std::time::Instant::now();
+							let batch = &frame.shards;
 							if let Some(addr) = client_address {
 								if batch.shard_count() == 0 {
 									continue;
@@ -367,10 +380,12 @@ fn spawn_handle_video_packets(
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr))
+									.wrap_cancel(socket.send_batch(batch, addr))
 									.await
 								{
-									Ok(failed_chunks) => {
+									Ok(report) => {
+										let failed_chunks = report.fallback_chunks;
+										frame.complete(dequeued_at, report, &diagnostics);
 										if failed_chunks > 0
 											&& last_send_warn
 												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
@@ -383,7 +398,7 @@ fn spawn_handle_video_packets(
 									},
 									Err(_) => break,
 								}
-							}
+							} else { diagnostics.count(Counter::NoClient); }
 						},
 						Ok(None) => {
 							tracing::debug!("Video packet channel closed.");
@@ -415,4 +430,63 @@ fn spawn_handle_video_packets(
 
 		tracing::debug!("Video packet stream stopped.");
 	});
+}
+
+#[cfg(test)]
+mod measurement_tests {
+	use super::*;
+	use std::time::{Duration, Instant};
+
+	#[test]
+	fn socket_completion_includes_queue_wait_and_does_not_double_count_subsets() {
+		let diagnostics = VideoDiagnostics::default();
+		let mut rx = diagnostics.subscribe();
+		let start = Instant::now() - Duration::from_millis(30);
+		let stats = metrics::test_frame(start);
+		assert_eq!(stats.accounted(), Duration::from_millis(11));
+		let frame = PacketFrame {
+			shards: ShardBatch::empty(),
+			stats,
+			enqueued_at: start + Duration::from_millis(11),
+		};
+		assert!(rx.try_recv().is_err(), "no completed sample at enqueue");
+		frame.complete(
+			start + Duration::from_millis(21),
+			gso_socket::SendReport {
+				bytes: 1400,
+				datagrams: 1,
+				..Default::default()
+			},
+			&diagnostics,
+		);
+		let stats = rx.try_recv().unwrap();
+		assert_eq!(stats.network_queue, Duration::from_millis(10));
+		assert!(stats.total >= Duration::from_millis(30));
+		assert_eq!(stats.total, stats.accounted());
+		assert!(stats.send_success);
+		assert_eq!(diagnostics.snapshot()["send_bytes"], 1400);
+	}
+
+	#[test]
+	fn send_failures_remain_observable() {
+		let diagnostics = VideoDiagnostics::default();
+		let mut rx = diagnostics.subscribe();
+		let start = Instant::now() - Duration::from_millis(20);
+		PacketFrame {
+			shards: ShardBatch::empty(),
+			stats: metrics::test_frame(start),
+			enqueued_at: start + Duration::from_millis(11),
+		}
+		.complete(
+			Instant::now(),
+			gso_socket::SendReport {
+				errors: 2,
+				..Default::default()
+			},
+			&diagnostics,
+		);
+		assert!(!rx.try_recv().unwrap().send_success);
+		assert_eq!(diagnostics.snapshot()["send_errors"], 2);
+		assert_eq!(diagnostics.snapshot()["send_failed_frames"], 1);
+	}
 }

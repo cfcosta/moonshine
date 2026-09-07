@@ -677,3 +677,36 @@ fn popup_initial_configure_is_sent_after_initial_surface_commit() {
 		"popup must be registered for rendering and hit testing"
 	);
 }
+
+#[test]
+fn buffer_age_tracks_attachments_without_resetting_on_callback_only_commits() {
+	use smithay::backend::renderer::utils::with_renderer_surface_state;
+	use smithay::reexports::wayland_server::Resource;
+	let mut h = Harness::new();
+	let root = h.toplevel();
+	h.map(&root.surface, 800, 600);
+	let surface = h.server_surface(&root.surface);
+	let buffer = with_renderer_surface_state(&surface, |s| s.buffer().unwrap().id()).unwrap();
+	let observation = Instant::now();
+	let initial = super::buffer_timing::age(&surface, &buffer, observation).unwrap();
+	root.surface.frame(&h.qh, 77);
+	root.surface.commit();
+	h.roundtrip();
+	assert_eq!(super::buffer_timing::age(&surface, &buffer, observation), Some(initial));
+	// Reattaching even the same wl_buffer is a new frame/attachment.
+	let before_reattach = Instant::now();
+	root.surface.attach(Some(h.buffers.last().unwrap()), 0, 0);
+	root.surface.commit();
+	h.roundtrip();
+	let after_reattach = Instant::now();
+	assert!(super::buffer_timing::age(&surface, &buffer, after_reattach).unwrap() <= after_reattach - before_reattach);
+	// A different buffer cannot inherit the old attachment timestamp.
+	h.map(&root.surface, 800, 600);
+	assert_eq!(super::buffer_timing::age(&surface, &buffer, Instant::now()), None);
+	let replacement = with_renderer_surface_state(&surface, |s| s.buffer().unwrap().id()).unwrap();
+	assert!(super::buffer_timing::age(&surface, &replacement, Instant::now()).is_some());
+	root.surface.attach(None, 0, 0);
+	root.surface.commit();
+	h.roundtrip();
+	assert_eq!(super::buffer_timing::age(&surface, &replacement, Instant::now()), None);
+}
