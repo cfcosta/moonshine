@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, watch};
 
 use super::processes::SessionProcesses;
 use crate::ShutdownReason;
@@ -18,6 +18,7 @@ use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
+use crate::session::stream::video::metrics::VideoDiagnostics;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
@@ -85,8 +86,8 @@ struct SessionManagerInner {
 	video_stream_context: Option<VideoStreamContext>,
 	audio_stream_context: Option<AudioStreamContext>,
 
-	/// Broadcast sender for per-frame encoding statistics.
-	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	/// Broadcast sender for per-frame host statistics after socket send attempts.
+	stats_tx: VideoDiagnostics,
 
 	/// Watchdog task for monitoring unexpected session shutdowns.
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
@@ -141,7 +142,7 @@ impl Drop for SessionManagerInner {
 #[derive(Clone)]
 pub struct SessionManager {
 	inner: Arc<Mutex<SessionManagerInner>>,
-	stats_tx: broadcast::Sender<FrameStats>,
+	stats_tx: VideoDiagnostics,
 }
 
 impl SessionManager {
@@ -175,7 +176,7 @@ impl SessionManager {
 			keys_tx: None,
 			video_stream_context: None,
 			audio_stream_context: None,
-			stats_tx: tokio::sync::broadcast::channel(256).0,
+			stats_tx: VideoDiagnostics::default(),
 			stop_watcher: None,
 			video_start_notify: None,
 			audio_start_notify: None,
@@ -190,12 +191,17 @@ impl SessionManager {
 		Ok(Self { inner, stats_tx })
 	}
 
-	/// Returns a receiver for per-frame encoding statistics.
+	/// Returns a receiver for per-frame host statistics after socket send attempts.
 	///
 	/// Call **before** `initialize_session()` to receive stats from the start.
 	/// Multiple receivers can be created — each receives a copy of every message.
 	pub fn bench_stats_receiver(&self) -> tokio::sync::broadcast::Receiver<FrameStats> {
 		self.stats_tx.subscribe()
+	}
+
+	/// Lifetime counters; subtract snapshots to measure a particular interval.
+	pub fn bench_counters(&self) -> std::collections::BTreeMap<String, u64> {
+		self.stats_tx.snapshot()
 	}
 
 	/// Trigger the video and audio pipelines to start encoding.

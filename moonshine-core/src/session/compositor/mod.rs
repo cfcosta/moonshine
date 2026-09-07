@@ -4,6 +4,8 @@
 //! with an in-process Smithay compositor. Frames are rendered to GBM-backed
 //! DMA-BUFs and exported directly to the video encoder.
 
+mod buffer_timing;
+mod capture_trigger;
 mod color_management;
 mod cursor;
 mod focus;
@@ -42,6 +44,7 @@ use crate::session::manager::SessionShutdownReason;
 use self::frame::ExportedFrame;
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
+use crate::session::stream::video::metrics::VideoDiagnostics;
 
 /// Keyboard configuration for the compositor's XKB state.
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -68,6 +71,8 @@ impl Default for KeyboardConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompositorConfig {
+	/// Allow single-surface DMA-BUF bypass. Disable to benchmark composition.
+	pub direct_scanout: bool,
 	/// Optional GPU device identifier for compositor rendering.
 	pub gpu: Option<String>,
 
@@ -82,6 +87,7 @@ impl Default for CompositorConfig {
 	fn default() -> Self {
 		Self {
 			gpu: None,
+			direct_scanout: true,
 			hdr: true,
 			keyboard: KeyboardConfig::default(),
 		}
@@ -114,6 +120,7 @@ pub(crate) struct CompositorHandles {
 
 /// Unlaunched compositor — holds channel endpoints, can only be launched.
 pub(crate) struct Compositor {
+	diagnostics: VideoDiagnostics,
 	config: CompositorConfig,
 	context: CompositorContext,
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -144,6 +151,7 @@ impl Compositor {
 		config: CompositorConfig,
 		context: CompositorContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		diagnostics: VideoDiagnostics,
 	) -> (Self, CompositorHandles) {
 		let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(2);
 		let (input_tx, input_rx) = calloop::channel::channel();
@@ -151,6 +159,7 @@ impl Compositor {
 
 		(
 			Self {
+				diagnostics,
 				config,
 				context,
 				stop,
@@ -166,6 +175,7 @@ impl Compositor {
 	pub fn launch(self, group: std::sync::Arc<super::processes::ProcessGroup>) -> Result<LaunchedCompositor, ()> {
 		let processes = group.begin_compositor()?;
 		let Self {
+			diagnostics,
 			config,
 			context,
 			stop,
@@ -178,7 +188,16 @@ impl Compositor {
 		std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
-				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, ready_tx, stop, processes) {
+				if let Err(e) = run_compositor(
+					config,
+					context,
+					frame_tx,
+					input_rx,
+					ready_tx,
+					stop,
+					diagnostics,
+					processes,
+				) {
 					tracing::error!("Compositor failed: {e}");
 				}
 			})
@@ -204,6 +223,7 @@ impl LaunchedCompositor {
 }
 
 /// Main compositor loop running on a dedicated thread.
+#[allow(clippy::too_many_arguments)]
 fn run_compositor(
 	config: CompositorConfig,
 	context: CompositorContext,
@@ -211,6 +231,7 @@ fn run_compositor(
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	ready_tx: mpsc::SyncSender<CompositorReady>,
 	stop: ShutdownManager<SessionShutdownReason>,
+	diagnostics: VideoDiagnostics,
 	processes: super::processes::CompositorProcessGuard,
 ) -> Result<(), String> {
 	let group = &processes.group;
@@ -372,7 +393,7 @@ fn run_compositor(
 	let damage_tracker = OutputDamageTracker::from_output(&output);
 
 	// Build the compositor state.
-	let (state, display) = MoonshineCompositor::new(
+	let (mut state, display) = MoonshineCompositor::new(
 		display,
 		display_handle.clone(),
 		event_loop.handle(),
@@ -391,6 +412,9 @@ fn run_compositor(
 		config.keyboard.clone(),
 	);
 
+	state.diagnostics = diagnostics;
+	state.allow_direct_scanout = config.direct_scanout;
+
 	// Insert the Wayland display as a calloop event source so client
 	// messages (including XWayland's protocol handshake) are dispatched
 	// whenever data arrives on the Wayland socket, not only after the
@@ -403,10 +427,12 @@ fn run_compositor(
 				// Safety: we never drop the display while the event loop runs.
 				unsafe {
 					let display = display.get_mut();
+					let previous_revision = state.capture_trigger.revision();
 					if let Err(e) = display.dispatch_clients(state) {
 						tracing::error!("Failed to dispatch Wayland clients: {e}");
 					}
 					state.refresh_popups();
+					state.capture_after_dispatch(previous_revision);
 
 					// Send deferred wp_image_description_info_v1 destructor events.
 					for info in state.deferred_info_done.drain(..) {
@@ -452,7 +478,8 @@ fn run_compositor(
 	event_loop
 		.handle()
 		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
-			state.render_and_export();
+			state.timer_lateness = std::time::Instant::now().saturating_duration_since(next_frame);
+			state.frame_tick();
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time
 			// jitter and keeps a steady cadence.

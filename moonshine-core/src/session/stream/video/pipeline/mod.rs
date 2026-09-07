@@ -3,6 +3,8 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+use crate::session::stream::video::metrics::{Counter, VideoDiagnostics};
+
 mod dmabuf;
 mod hdr_sei;
 
@@ -18,8 +20,10 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+use crate::session::compositor::frame::CaptureTiming;
+use crate::session::stream::video::CapturePath;
+use crate::session::stream::video::PacketFrame;
 use crate::session::stream::video::packetizer::Packetizer;
-use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
@@ -33,7 +37,7 @@ use pixelforge::{
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
-/// packetized and sent) before we start dropping new captures.
+/// handed to the socket sender) before we start dropping new captures.
 ///
 /// This is the pipeline's backpressure policy, chosen for low latency: rather
 /// than block the encoding thread and let already-captured frames queue up
@@ -43,7 +47,8 @@ use pixelforge::{
 /// valid — a dropped frame never enters the encoder's reference state, unlike
 /// discarding an already-encoded packet, which would break decoding until the
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
-/// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
+/// GPU fed plus one slot of slack. The separate network channel can hold more
+/// frames; this gate does not bound total latency through socket completion.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
@@ -181,7 +186,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 		send_p50_us = p50(&sends),
 		send_p95_us = p95(&sends),
 		send_p99_us = p99(&sends),
-		"Frame latency summary (μs)"
+		"Export-to-network-enqueue latency summary (μs; excludes capture and socket send)"
 	);
 }
 
@@ -190,6 +195,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 /// single [`ConsumerMessage::Frame`], so the packet is paired with its context by
 /// construction — there is no separate packet channel to keep in lockstep.
 struct FrameContext {
+	timing: CaptureTiming,
 	/// When the source frame was captured (for end-to-end latency).
 	created_at: std::time::Instant,
 	/// Pre-encode latency breakdown measured on the encoding thread.
@@ -212,6 +218,9 @@ struct FrameContext {
 
 /// Message from the encoding thread to the packet consumer thread, in
 /// submission order.
+// The bounded channel has five slots. Keep context inline to avoid a heap
+// allocation per frame just to shrink the uncommon reset variant.
+#[allow(clippy::large_enum_variant)]
 enum ConsumerMessage {
 	/// A submitted frame's context together with the [`EncodeFuture`] that
 	/// resolves with its encoded packet. Awaiting the future yields the packet
@@ -250,8 +259,8 @@ impl Drop for InFlightGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
-	packet_tx: mpsc::Sender<ShardBatch>,
-	stats_tx: broadcast::Sender<FrameStats>,
+	packet_tx: mpsc::Sender<PacketFrame>,
+	stats_tx: VideoDiagnostics,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
 	mut packetizer: Packetizer,
@@ -285,6 +294,7 @@ async fn run_packet_consumer(
 		let mut packet = match future.await {
 			Ok(packet) => packet,
 			Err(e) => {
+				stats_tx.count(Counter::ReadbackErrors);
 				// A frame whose bitstream overflowed its destination buffer was
 				// truncated and is not sent. Request an IDR so the next frame is a
 				// keyframe, keeping the client's reference chain decodable.
@@ -321,7 +331,7 @@ async fn run_packet_consumer(
 		let rtp_timestamp = (packet.pts * 90000 / ctx.fps as u64) as u32;
 		frame_number += 1;
 
-		let t_start = std::time::Instant::now();
+		let t_start = t_packet_ready;
 		// Capture-to-packetization latency in 100µs units, clamped to u16::MAX
 		// (~6.55s). Clamp in the wider u128 *before* the cast, otherwise the
 		// `as u16` would wrap for latencies > ~6.55s and report a tiny value.
@@ -345,6 +355,7 @@ async fn run_packet_consumer(
 			// requests an IDR, which recovers the stream.
 			Err(()) => {
 				tracing::warn!("Failed to packetize encoded frame");
+				stats_tx.count(Counter::PacketizeErrors);
 				continue;
 			},
 		};
@@ -355,12 +366,47 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.send(shards).await.is_err() {
-			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
-			break;
-		}
-
+		// Reserve first so publication time excludes time waiting for capacity.
+		let permit = match packet_tx.reserve().await {
+			Ok(permit) => permit,
+			Err(_) => break,
+		};
 		let t_sent = std::time::Instant::now();
+		let stats = FrameStats {
+			frame_number,
+			capture_path: frame_context.timing.path,
+			capture_started_at: frame_context.timing.started_at,
+			completed_at: t_sent,
+			scene_wait: frame_context.timing.scene_wait,
+			buffer_age: frame_context.timing.buffer_age,
+			timer_lateness: frame_context.timing.timer_lateness,
+			capture: frame_context.created_at.duration_since(frame_context.timing.started_at),
+			render_wait: frame_context.timing.render_wait,
+			channel_wait: frame_context.channel_wait,
+			import: frame_context.import,
+			convert: frame_context.convert,
+			submit: frame_context.submit,
+			consumer_queue: consumer_queue_dur,
+			encode_wait: encode_wait_dur,
+			packetize: t_packetized - t_start,
+			send: t_sent - t_packetized,
+			network_queue: std::time::Duration::ZERO,
+			network_send: std::time::Duration::ZERO,
+			total: t_sent.duration_since(frame_context.timing.started_at),
+			network_queue_depth: packet_tx.max_capacity() - packet_tx.capacity() - 1,
+			send_success: false,
+			send_errors: 0,
+			sent_bytes: 0,
+			sent_datagrams: 0,
+			gso_fallback_chunks: 0,
+			encoded_bytes,
+			is_key_frame,
+		};
+		permit.send(PacketFrame {
+			shards,
+			stats,
+			enqueued_at: t_sent,
+		});
 
 		let packetize_dur = t_packetized - t_start;
 		let send_dur = t_sent - t_packetized;
@@ -381,26 +427,12 @@ async fn run_packet_consumer(
 				encoded_bytes,
 				is_key_frame,
 				buffer_index = frame_context.buffer_index,
-				"SPIKE: frame latency exceeds {}us",
+				"SPIKE: export-to-network-enqueue latency exceeds {}us",
 				frame_interval_us
 			);
 		}
 
 		latency_samples.push(LatencySample {
-			channel_wait: frame_context.channel_wait,
-			import: frame_context.import,
-			convert: frame_context.convert,
-			submit: frame_context.submit,
-			consumer_queue: consumer_queue_dur,
-			encode_wait: encode_wait_dur,
-			packetize: packetize_dur,
-			send: send_dur,
-			total,
-			encoded_bytes,
-			is_key_frame,
-		});
-
-		let _ = stats_tx.send(FrameStats {
 			channel_wait: frame_context.channel_wait,
 			import: frame_context.import,
 			convert: frame_context.convert,
@@ -430,7 +462,7 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketFrame>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -438,7 +470,7 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: VideoDiagnostics,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -488,7 +520,7 @@ impl VideoPipelineInner {
 		self,
 		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketFrame>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -496,7 +528,7 @@ impl VideoPipelineInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: VideoDiagnostics,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -612,14 +644,14 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<PacketFrame>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		mut reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: VideoDiagnostics,
 	) -> Result<(), String> {
 		let ctx = &self.context;
 
@@ -653,7 +685,7 @@ impl VideoPipelineInner {
 			runtime.spawn(run_packet_consumer(
 				frame_ctx_rx,
 				packet_tx,
-				stats_tx,
+				stats_tx.clone(),
 				in_flight,
 				idr_tx.clone(),
 				packetizer,
@@ -804,6 +836,11 @@ impl VideoPipelineInner {
 								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
+									timing: CaptureTiming {
+										started_at: now,
+										path: CapturePath::Reencode,
+										..Default::default()
+									},
 									created_at: now,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
@@ -816,10 +853,14 @@ impl VideoPipelineInner {
 								};
 								// Count this frame in flight; the consumer decrements when done.
 								in_flight.fetch_add(1, Ordering::Relaxed);
+								stats_tx.count(Counter::Submitted);
 								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
 							},
-							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
+							Err(e) => {
+								stats_tx.count(Counter::SubmitErrors);
+								tracing::warn!("Failed to re-encode frame for IDR request: {e}");
+							},
 						}
 					}
 					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
@@ -842,6 +883,7 @@ impl VideoPipelineInner {
 				// the encoder's reference state). The IDR re-encode path is never
 				// gated — the client needs that keyframe.
 				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
+					stats_tx.count(Counter::EncodeBackpressure);
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
 							"Video encode backpressure: packet consumer is behind; dropping captured \
@@ -873,6 +915,7 @@ impl VideoPipelineInner {
 						},
 						Err(e) => {
 							tracing::warn!("Failed to create DMA-BUF importer: {e}");
+							stats_tx.count(Counter::ImportErrors);
 							frame.consumed.store(true, Ordering::Release);
 							continue;
 						},
@@ -906,6 +949,7 @@ impl VideoPipelineInner {
 						Ok(result) => result,
 						Err(e) => {
 							tracing::warn!("Failed to import DMA-BUF: {e}");
+							stats_tx.count(Counter::ImportErrors);
 							frame.consumed.store(true, Ordering::Release);
 							continue;
 						},
@@ -1016,6 +1060,7 @@ impl VideoPipelineInner {
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
+					stats_tx.count(Counter::ConvertErrors);
 					frame.consumed.store(true, Ordering::Release);
 					if is_device_lost(&e) {
 						return Err(format!("GPU color conversion failed: {e}"));
@@ -1071,6 +1116,7 @@ impl VideoPipelineInner {
 						// needed, packetizes and sends it, and records stats.
 						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 						let frame_context = FrameContext {
+							timing: frame.timing.clone(),
 							created_at: frame.created_at,
 							channel_wait: t1_received.duration_since(frame.created_at),
 							import: t2_imported.duration_since(t1_received),
@@ -1083,6 +1129,7 @@ impl VideoPipelineInner {
 						};
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);
+						stats_tx.count(Counter::Submitted);
 						submitted_count += 1;
 						if frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(frame_context, future))
@@ -1093,6 +1140,7 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
+						stats_tx.count(Counter::SubmitErrors);
 						if is_device_lost(&e) {
 							return Err(format!("Failed to encode frame: {e}"));
 						}

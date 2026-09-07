@@ -1,4 +1,3 @@
-use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
@@ -24,61 +23,88 @@ use moonshine_core::session::stream::video::VideoStreamContext;
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-#[derive(Parser, Debug)]
-#[command(name = "moonshine-bench", about = "Benchmark Moonshine's encoding pipeline")]
-struct Args {
-	/// Command to run (application to spawn).
-	command: Vec<String>,
+use serde_json::json;
+use std::collections::{BTreeMap, VecDeque};
+use std::fs::File;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-	/// Run the built-in 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1 benchmark matrix.
+#[path = "bench/raw.rs"]
+mod raw;
+#[path = "bench/receiver.rs"]
+mod receiver;
+#[path = "bench/report.rs"]
+mod report;
+
+#[derive(Parser, Debug)]
+#[command(
+	name = "moonshine-bench",
+	about = "Measure host video latency and loopback receipt (not client display latency)"
+)]
+struct Args {
+	/// Application and arguments. Use -- before the command.
+	#[arg(required = true, trailing_var_arg = true)]
+	command: Vec<String>,
+	/// Built-in 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1 matrix.
 	#[arg(long)]
 	matrix: bool,
-
-	/// Stream resolution (WxH).
 	#[arg(long, default_value = "1920x1080")]
 	resolution: String,
-
-	/// Target FPS.
-	#[arg(long, default_value_t = 60)]
+	#[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=1000))]
 	fps: u32,
-
-	/// Target bitrate in bits per second.
 	#[arg(long, default_value_t = 20_000_000)]
 	bitrate: usize,
-
-	/// Video codec.
 	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1"])]
 	codec: String,
-
-	/// Seconds to run before stopping (0 = run until Ctrl+C).
-	#[arg(long, default_value_t = 0)]
+	/// Measurement seconds AFTER warmup; finite runs make comparisons repeatable.
+	#[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
 	duration: u64,
-
-	/// Seconds to discard before recording stats (warmup period).
 	#[arg(long, default_value_t = 4)]
 	warmup: u64,
-
-	/// Enable HDR mode.
+	#[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+	repeat: u32,
 	#[arg(long)]
 	hdr: bool,
-
-	/// Print per-frame stats to stderr instead of periodic summary.
+	#[arg(long)]
+	gpu: Option<String>,
+	/// Force the GLES compositor path for a controlled comparison.
+	#[arg(long)]
+	composited: bool,
+	#[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u8).range(0..=100))]
+	fec: u8,
+	#[arg(long, default_value_t = 47998, value_parser = clap::value_parser!(u16).range(1..))]
+	port: u16,
+	/// New directory for JSON reports. Existing directories are rejected.
+	#[arg(long)]
+	output: Option<PathBuf>,
+	/// Include per-frame JSONL using a separate bounded writer thread.
+	#[arg(long, requires = "output")]
+	raw: bool,
+	/// Human workload description, e.g. game/scene/settings, included in comparisons.
+	#[arg(long, default_value = "unspecified")]
+	workload: String,
+	/// Label the build/experiment without changing workload compatibility.
+	#[arg(long, default_value = "unlabelled")]
+	label: String,
+	/// Log each measured frame; use only for diagnosis (can perturb timings).
 	#[arg(long)]
 	verbose: bool,
 }
 
-fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
-	let parts: Vec<&str> = s.split('x').collect();
-	if parts.len() != 2 {
-		return Err("Invalid resolution format, expected WxH (e.g. 1920x1080)".to_string());
+type Error = Box<dyn std::error::Error>;
+fn error(message: impl Into<String>) -> Error {
+	std::io::Error::other(message.into()).into()
+}
+fn parse_resolution(text: &str) -> Result<(u32, u32), Error> {
+	let (w, h) = text.split_once('x').ok_or_else(|| error("resolution must be WxH"))?;
+	let (w, h) = (w.parse::<u32>()?, h.parse::<u32>()?);
+	if w == 0 || h == 0 {
+		return Err(error("resolution must be positive"));
 	}
-	let w = parts[0].parse::<u32>().map_err(|e| format!("Invalid width: {}", e))?;
-	let h = parts[1].parse::<u32>().map_err(|e| format!("Invalid height: {}", e))?;
 	Ok((w, h))
 }
-
-fn parse_codec(s: &str) -> VideoFormat {
-	match s {
+fn parse_codec(codec: &str) -> VideoFormat {
+	match codec {
 		"h264" => VideoFormat::H264,
 		"hevc" => VideoFormat::Hevc,
 		"av1" => VideoFormat::Av1,
@@ -86,471 +112,208 @@ fn parse_codec(s: &str) -> VideoFormat {
 	}
 }
 
-fn percentiles(samples: &[u64]) -> (u64, u64, u64) {
-	if samples.is_empty() {
-		return (0, 0, 0);
-	}
-
-	fn percentile(sorted: &[u64], p: f64) -> u64 {
-		let idx = ((sorted.len() as f64 * p).ceil() as usize)
-			.saturating_sub(1)
-			.min(sorted.len() - 1);
-		sorted[idx]
-	}
-
-	let mut sorted = samples.to_vec();
-	sorted.sort_unstable();
-	(
-		percentile(&sorted, 0.50),
-		percentile(&sorted, 0.95),
-		percentile(&sorted, 0.99),
-	)
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+	let result = std::process::Command::new(program).args(args).output().ok()?;
+	result
+		.status
+		.success()
+		.then(|| String::from_utf8_lossy(&result.stdout).trim().to_string())
 }
-
-#[derive(Clone, Debug)]
-struct LatencyDistribution {
-	avg_us: f64,
-	min_us: u64,
-	max_us: u64,
-	p50_us: u64,
-	p95_us: u64,
-	p99_us: u64,
-}
-
-impl LatencyDistribution {
-	fn new(total_us: u128, samples: &[u64]) -> Self {
-		if samples.is_empty() {
-			return Self {
-				avg_us: 0.0,
-				min_us: 0,
-				max_us: 0,
-				p50_us: 0,
-				p95_us: 0,
-				p99_us: 0,
-			};
-		}
-
-		let (p50_us, p95_us, p99_us) = percentiles(samples);
-		let count = samples.len() as f64;
-		Self {
-			avg_us: total_us as f64 / count,
-			min_us: samples.iter().copied().min().unwrap_or(0),
-			max_us: samples.iter().copied().max().unwrap_or(0),
-			p50_us,
-			p95_us,
-			p99_us,
-		}
-	}
-
-	fn matrix_value(&self) -> String {
-		format!(
-			"{:.0}/{}/{}/{}/{}",
-			self.avg_us, self.p50_us, self.p95_us, self.p99_us, self.max_us
-		)
-	}
-}
-
-#[derive(Clone, Debug)]
-struct StatsSummary {
-	count: u64,
-	fps: f64,
-	mbps: f64,
-	total: LatencyDistribution,
-	submit: LatencyDistribution,
-	encode_wait: LatencyDistribution,
-	avg_channel_wait_us: f64,
-	avg_import_us: f64,
-	avg_convert_us: f64,
-	avg_consumer_queue_us: f64,
-	avg_packetize_us: f64,
-	avg_send_us: f64,
-	key_frames: u64,
-}
-
-impl StatsSummary {
-	fn avg_accounted_us(&self) -> f64 {
-		self.avg_channel_wait_us
-			+ self.avg_import_us
-			+ self.avg_convert_us
-			+ self.submit.avg_us
-			+ self.encode_wait.avg_us
-			+ self.avg_packetize_us
-			+ self.avg_send_us
-	}
-
-	fn avg_delta_us(&self) -> f64 {
-		self.total.avg_us - self.avg_accounted_us()
-	}
-}
-
-struct BenchmarkReport {
-	resolution_label: &'static str,
-	resolution: String,
-	target_fps: u32,
-	codec: String,
-	summary: Option<StatsSummary>,
-	interrupted: bool,
-}
-
-struct MatrixReport {
-	resolution_label: &'static str,
-	resolution: String,
-	target_fps: u32,
-	codec: String,
-	status: MatrixStatus,
-}
-
-enum MatrixStatus {
-	Ok(Option<StatsSummary>),
-	Failed(String),
-	Interrupted(Option<StatsSummary>),
-}
-
-struct StatsAccumulator {
-	count: u64,
-	total_us: u128,
-	channel_wait_us: u128,
-	import_us: u128,
-	convert_us: u128,
-	submit_us: u128,
-	consumer_queue_us: u128,
-	encode_wait_us: u128,
-	packetize_us: u128,
-	send_us: u128,
-	total_samples_us: Vec<u64>,
-	submit_samples_us: Vec<u64>,
-	encode_wait_samples_us: Vec<u64>,
-	key_frames: u64,
-	encoded_bytes: u64,
-	start: Instant,
-	last_print: Instant,
-}
-
-impl StatsAccumulator {
-	fn new() -> Self {
-		let now = Instant::now();
-		Self {
-			count: 0,
-			total_us: 0,
-			channel_wait_us: 0,
-			import_us: 0,
-			convert_us: 0,
-			submit_us: 0,
-			consumer_queue_us: 0,
-			encode_wait_us: 0,
-			packetize_us: 0,
-			send_us: 0,
-			total_samples_us: Vec::new(),
-			submit_samples_us: Vec::new(),
-			encode_wait_samples_us: Vec::new(),
-			key_frames: 0,
-			encoded_bytes: 0,
-			start: now,
-			last_print: now,
-		}
-	}
-
-	fn add(&mut self, stats: &FrameStats) {
-		if self.count == 0 {
-			let now = Instant::now();
-			self.start = now;
-			self.last_print = now;
-		}
-		self.count += 1;
-		let total = stats.total.as_micros() as u64;
-		let submit = stats.submit.as_micros() as u64;
-		let encode_wait = stats.encode_wait.as_micros() as u64;
-		self.total_us += total as u128;
-		self.channel_wait_us += stats.channel_wait.as_micros();
-		self.import_us += stats.import.as_micros();
-		self.convert_us += stats.convert.as_micros();
-		self.submit_us += submit as u128;
-		self.consumer_queue_us += stats.consumer_queue.as_micros();
-		self.encode_wait_us += encode_wait as u128;
-		self.packetize_us += stats.packetize.as_micros();
-		self.send_us += stats.send.as_micros();
-		self.total_samples_us.push(total);
-		self.submit_samples_us.push(submit);
-		self.encode_wait_samples_us.push(encode_wait);
-		if stats.is_key_frame {
-			self.key_frames += 1;
-		}
-		self.encoded_bytes += stats.encoded_bytes as u64;
-	}
-
-	fn summary(&self) -> Option<StatsSummary> {
-		if self.count == 0 {
-			return None;
-		}
-		let elapsed = self.start.elapsed().as_secs_f64();
-		let fps = if elapsed > 0.0 {
-			self.count as f64 / elapsed
-		} else {
-			0.0
-		};
-		let mbps = if elapsed > 0.0 {
-			self.encoded_bytes as f64 * 8.0 / elapsed / 1_000_000.0
-		} else {
-			0.0
-		};
-
-		Some(StatsSummary {
-			count: self.count,
-			fps,
-			mbps,
-			total: LatencyDistribution::new(self.total_us, &self.total_samples_us),
-			submit: LatencyDistribution::new(self.submit_us, &self.submit_samples_us),
-			encode_wait: LatencyDistribution::new(self.encode_wait_us, &self.encode_wait_samples_us),
-			avg_channel_wait_us: self.channel_wait_us as f64 / self.count as f64,
-			avg_import_us: self.import_us as f64 / self.count as f64,
-			avg_convert_us: self.convert_us as f64 / self.count as f64,
-			avg_consumer_queue_us: self.consumer_queue_us as f64 / self.count as f64,
-			avg_packetize_us: self.packetize_us as f64 / self.count as f64,
-			avg_send_us: self.send_us as f64 / self.count as f64,
-			key_frames: self.key_frames,
+fn environment() -> serde_json::Value {
+	let gpus: BTreeMap<_, _> = std::fs::read_dir("/sys/class/drm")
+		.into_iter()
+		.flatten()
+		.flatten()
+		.filter(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+		.map(|entry| {
+			(
+				entry.file_name().to_string_lossy().to_string(),
+				std::fs::read_to_string(entry.path().join("device/uevent")).unwrap_or_default(),
+			)
 		})
-	}
-
-	fn print_summary(&self, label: &str) -> Option<StatsSummary> {
-		let summary = self.summary()?;
-
-		tracing::info!(
-			"{} [{} frames, {:.1} fps, {:.2} Mbps]",
-			label,
-			summary.count,
-			summary.fps,
-			summary.mbps
-		);
-		tracing::info!(
-			"  total:    avg={avg_total:.0}us  min={}us  max={}us",
-			summary.total.min_us,
-			summary.total.max_us,
-			avg_total = summary.total.avg_us
-		);
-		tracing::info!(
-			"            p50={}us  p95={}us  p99={}us",
-			summary.total.p50_us,
-			summary.total.p95_us,
-			summary.total.p99_us
-		);
-		tracing::info!(
-			"  submit:   avg={avg_submit:.0}us  min={}us  max={}us",
-			summary.submit.min_us,
-			summary.submit.max_us,
-			avg_submit = summary.submit.avg_us
-		);
-		tracing::info!(
-			"            p50={}us  p95={}us  p99={}us",
-			summary.submit.p50_us,
-			summary.submit.p95_us,
-			summary.submit.p99_us
-		);
-		tracing::info!(
-			"  enc_wait: avg={avg_encode_wait:.0}us  min={}us  max={}us",
-			summary.encode_wait.min_us,
-			summary.encode_wait.max_us,
-			avg_encode_wait = summary.encode_wait.avg_us
-		);
-		tracing::info!(
-			"            p50={}us  p95={}us  p99={}us",
-			summary.encode_wait.p50_us,
-			summary.encode_wait.p95_us,
-			summary.encode_wait.p99_us
-		);
-		tracing::info!(
-			"  avg breakdown: ch_wait={avg_channel_wait:.0}us  import={avg_import:.0}us  convert={avg_convert:.0}us  submit={avg_submit:.0}us  enc_wait={avg_encode_wait:.0}us  pkt={avg_packetize:.0}us  send={avg_send:.0}us",
-			avg_channel_wait = summary.avg_channel_wait_us,
-			avg_import = summary.avg_import_us,
-			avg_convert = summary.avg_convert_us,
-			avg_submit = summary.submit.avg_us,
-			avg_encode_wait = summary.encode_wait.avg_us,
-			avg_packetize = summary.avg_packetize_us,
-			avg_send = summary.avg_send_us,
-		);
-		tracing::info!(
-			"  accounted: avg={avg_accounted:.0}us  delta={avg_delta:.0}us  queue_diag={avg_consumer_queue:.0}us",
-			avg_accounted = summary.avg_accounted_us(),
-			avg_delta = summary.avg_delta_us(),
-			avg_consumer_queue = summary.avg_consumer_queue_us
-		);
-		tracing::info!("  key_frames: {}", summary.key_frames);
-
-		Some(summary)
-	}
-
-	fn print_and_reset_interval(&mut self) -> Self {
-		self.print_summary("Interval");
-		Self::new()
-	}
+		.collect();
+	let executable = std::env::current_exe().ok();
+	json!({
+		"version": env!("CARGO_PKG_VERSION"), "debug_assertions": cfg!(debug_assertions),
+		"executable": executable,
+		"binary_sha256": executable.as_ref().and_then(|p| command_output("sha256sum", &[p.to_str()?]))
+			.and_then(|s| s.split_whitespace().next().map(str::to_string)),
+		"working_tree_revision_at_run": command_output("git", &["rev-parse", "HEAD"]),
+		"working_tree_changes_at_run": command_output("git", &["status", "--porcelain"]),
+		"kernel": std::fs::read_to_string("/proc/sys/kernel/osrelease").ok(),
+		"cpu": std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| s.lines().find(|l| l.starts_with("model name")).map(str::to_string)),
+		"available_render_devices": gpus,
+		"nvidia_driver": std::fs::read_to_string("/proc/driver/nvidia/version").ok(),
+		"runtime_gpu_settings": (["VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_LAYER_PATH", "VK_INSTANCE_LAYERS", "__GLX_VENDOR_LIBRARY_NAME", "MOONSHINE_LOG", "MOONSHINE_RENDER_NODE", "LD_LIBRARY_PATH"]
+			.into_iter().map(|key| (key, std::env::var(key).ok())).collect::<BTreeMap<_,_>>()),
+	})
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Error> {
 	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
+		.with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
 		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
 		.init();
-
 	let args = Args::parse();
-
-	if args.command.is_empty() {
-		tracing::error!("No command provided. Usage: moonshine-bench [OPTIONS] <COMMAND>");
-		std::process::exit(1);
+	parse_resolution(&args.resolution)?;
+	if args.bitrate == 0 || args.bitrate > u32::MAX as usize {
+		return Err(error("bitrate must fit a positive u32"));
 	}
-
-	if args.matrix {
-		run_matrix(&args).await
-	} else {
-		run_single(&args).await
+	if args
+		.duration
+		.checked_add(args.warmup)
+		.is_none_or(|seconds| seconds > 86400)
+	{
+		return Err(error("duration plus warmup must be at most 86400 seconds"));
 	}
-}
-
-async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await?;
-	Ok(())
-}
-
-async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	const RESOLUTIONS: [(&str, &str); 3] = [("4k", "3840x2160"), ("1440p", "2560x1440"), ("1080p", "1920x1080")];
-	const FPS_VALUES: [u32; 3] = [60, 120, 360];
-	const CODECS: [&str; 3] = ["hevc", "h264", "av1"];
-
-	let duration = if args.duration == 0 {
-		tracing::info!("Matrix mode requires a finite duration; defaulting to 8s. Pass --duration to override.");
-		8
+	if let Some(output) = &args.output {
+		std::fs::create_dir(output)?;
+	}
+	let environment = environment();
+	if cfg!(debug_assertions) {
+		tracing::warn!("Debug build: results will be marked unsuitable for performance comparisons; use --release");
+	}
+	let settings: Vec<(String, u32, String)> = if args.matrix {
+		["3840x2160", "2560x1440", "1920x1080"]
+			.into_iter()
+			.flat_map(|resolution| {
+				[60, 120, 360].into_iter().flat_map(move |fps| {
+					["hevc", "h264", "av1"]
+						.into_iter()
+						.map(move |codec| (resolution.into(), fps, codec.into()))
+				})
+			})
+			.collect()
 	} else {
-		args.duration
+		vec![(args.resolution.clone(), args.fps, args.codec.clone())]
 	};
-
-	let mut reports = Vec::new();
-	let mut interrupted = false;
-
-	tracing::info!("Starting Moonshine benchmark matrix");
-	tracing::info!("  command:    {}", args.command.join(" "));
-	tracing::info!("  duration:   {}s", duration);
-	tracing::info!("  warmup:     {}s", args.warmup);
-	tracing::info!("  fps:        {:?}", FPS_VALUES);
-	tracing::info!("  bitrate:    {} bps", args.bitrate);
-	tracing::info!("  hdr:        {}", args.hdr);
-
-	'outer: for (resolution_label, resolution) in RESOLUTIONS {
-		for fps in FPS_VALUES {
-			for codec in CODECS {
-				tracing::info!(
-					"Starting matrix run: {} {} {}fps {}",
-					resolution_label,
-					resolution,
-					fps,
-					codec
-				);
-
-				match run_benchmark(args, resolution_label, resolution, fps, codec, duration).await {
-					Ok(report) => {
-						interrupted = report.interrupted;
-						let status = if report.interrupted {
-							MatrixStatus::Interrupted(report.summary)
-						} else {
-							MatrixStatus::Ok(report.summary)
-						};
-						reports.push(MatrixReport {
-							resolution_label: report.resolution_label,
-							resolution: report.resolution,
-							target_fps: report.target_fps,
-							codec: report.codec,
-							status,
-						});
-
-						if interrupted {
-							break 'outer;
-						}
-					},
-					Err(err) => {
-						tracing::error!(
-							"Matrix run failed: {} {} {}fps {}: {}",
-							resolution_label,
-							resolution,
-							fps,
-							codec,
-							err
-						);
-						reports.push(MatrixReport {
-							resolution_label,
-							resolution: resolution.to_string(),
-							target_fps: fps,
-							codec: codec.to_string(),
-							status: MatrixStatus::Failed(err.to_string()),
-						});
-					},
-				}
+	let mut invalid = 0;
+	let mut run = 0;
+	for repetition in 1..=args.repeat {
+		for (resolution, fps, codec) in &settings {
+			run += 1;
+			let result = run_benchmark(
+				&args,
+				resolution,
+				*fps,
+				codec,
+				args.duration,
+				run,
+				repetition,
+				&environment,
+			)
+			.await;
+			match result {
+				Ok((valid, interrupted)) => {
+					invalid += usize::from(!valid);
+					if interrupted {
+						return Err(error("benchmark interrupted; partial report retained"));
+					}
+				},
+				Err(err) => {
+					if let Some(output) = &args.output {
+						serde_json::to_writer_pretty(
+							File::create_new(output.join(format!("run-{run:03}-error.json")))?,
+							&json!({"schema_version":1,"valid":false,"error":err.to_string(),
+                                "resolution":resolution,"fps":fps,"codec":codec,"repetition":repetition}),
+						)?;
+					}
+					if !args.matrix {
+						return Err(err);
+					}
+					tracing::error!("Matrix run {run} failed: {err}");
+					invalid += 1;
+				},
 			}
 		}
 	}
-
-	print_matrix_summary(&reports);
-
-	if interrupted {
-		return Err(boxed_error("Matrix benchmark interrupted"));
+	if invalid > 0 {
+		return Err(error(format!(
+			"{invalid} run(s) failed measurement validity checks; see reports"
+		)));
 	}
-
-	let failures = reports
-		.iter()
-		.filter(|report| matches!(report.status, MatrixStatus::Failed(_)))
-		.count();
-	if failures > 0 {
-		return Err(boxed_error(format!("{failures} matrix benchmark run(s) failed")));
-	}
-
 	Ok(())
 }
 
+fn resolve_receipts(
+	pending: &mut VecDeque<FrameStats>,
+	receiver: &receiver::Receiver,
+	accumulator: &mut report::Accumulator,
+	expire: bool,
+) {
+	let mut remaining = VecDeque::new();
+	while let Some(frame) = pending.pop_front() {
+		if let Some(receipt) = receiver.take_complete(frame.frame_number, frame.sent_datagrams) {
+			accumulator.record(
+				"loopback_first",
+				report::us(receipt.first.saturating_duration_since(frame.capture_started_at)),
+			);
+			accumulator.record(
+				"loopback_complete",
+				report::us(receipt.last.saturating_duration_since(frame.capture_started_at)),
+			);
+			accumulator.record(
+				"loopback_spread",
+				report::us(receipt.last.duration_since(receipt.first)),
+			);
+		} else if expire || frame.completed_at.elapsed() >= Duration::from_millis(250) {
+			accumulator.incomplete_receipts += 1;
+			receiver.discard(frame.frame_number);
+		} else {
+			remaining.push_back(frame);
+		}
+	}
+	*pending = remaining;
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_benchmark(
 	args: &Args,
-	resolution_label: &'static str,
 	resolution: &str,
 	target_fps: u32,
 	codec: &str,
 	duration: u64,
-) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
-	const STREAM_TIMEOUT_SECS: u64 = 60;
-
-	let (width, height) = parse_resolution(resolution).map_err(boxed_error)?;
+	run: usize,
+	repetition: u32,
+	environment: &serde_json::Value,
+) -> Result<(bool, bool), Error> {
+	let (width, height) = parse_resolution(resolution)?;
 	let video_format = parse_codec(codec);
-
-	tracing::info!("Starting Moonshine benchmark");
-	tracing::info!("  command:    {}", args.command.join(" "));
-	tracing::info!("  resolution: {}x{}", width, height);
-	tracing::info!("  fps:        {}", target_fps);
-	tracing::info!("  bitrate:    {} bps", args.bitrate);
-	tracing::info!("  codec:      {}", codec);
-	tracing::info!("  hdr:        {}", args.hdr);
-	let duration_str = if duration == 0 {
-		"infinite".to_string()
-	} else {
-		duration.to_string()
-	};
-	tracing::info!("  duration:   {}s", duration_str);
-	tracing::info!("  warmup:     {}s", args.warmup);
-
+	tracing::info!(
+		"Run {run}: {resolution} {target_fps} FPS {codec}; {}s warmup + {duration}s measurement",
+		args.warmup
+	);
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
 	let session_manager = SessionManager::new(
-		CompositorConfig::default(),
-		VideoStreamConfig::default(),
+		CompositorConfig {
+			gpu: args.gpu.clone(),
+			direct_scanout: !args.composited,
+			..Default::default()
+		},
+		VideoStreamConfig {
+			port: args.port,
+			fec_percentage: args.fec,
+			..Default::default()
+		},
 		AudioStreamConfig { port: 0 },
 		ControlStreamConfig {
 			port: 0,
 			..Default::default()
 		},
 		"127.0.0.1".to_string(),
-		STREAM_TIMEOUT_SECS,
+		duration.saturating_add(args.warmup).saturating_add(120),
 		false,
 		shutdown.clone(),
 	)
-	.map_err(|_| boxed_error("Failed to create session manager"))?;
+	.map_err(|_| error("Failed to create session manager"))?;
 
 	let mut stats_rx = session_manager.bench_stats_receiver();
 
 	let app_config = ApplicationConfig {
 		title: "bench".to_string(),
+		stdout: Some("journal".to_string()),
+		stderr: Some("journal".to_string()),
 		command: args.command.clone(),
 		..Default::default()
 	};
@@ -573,12 +336,12 @@ async fn run_benchmark(
 	session_manager
 		.initialize_session(session_ctx)
 		.await
-		.map_err(|_| boxed_error("Failed to initialize session"))?;
+		.map_err(|_| error("Failed to initialize session"))?;
 
 	tracing::info!("Launching session (compositor + app)...");
 	if let Err(err) = session_manager.launch_session().await {
 		let _ = session_manager.stop_session().await;
-		return Err(boxed_error(format!("Failed to launch session: {err:?}")));
+		return Err(error(format!("Failed to launch session: {err:?}")));
 	}
 
 	let video_ctx = VideoStreamContext {
@@ -611,244 +374,197 @@ async fn run_benchmark(
 	tracing::info!("Setting stream contexts...");
 	if let Err(err) = session_manager.set_stream_context(video_ctx, audio_ctx).await {
 		let _ = session_manager.stop_session().await;
-		return Err(boxed_error(format!("Failed to set stream context: {err:?}")));
+		return Err(error(format!("Failed to set stream context: {err:?}")));
 	}
 
 	tracing::info!("Starting session streams...");
 	if let Err(err) = session_manager.start_session().await {
 		let _ = session_manager.stop_session().await;
-		return Err(boxed_error(format!("Failed to start session: {err:?}")));
+		return Err(error(format!("Failed to start session: {err:?}")));
 	}
 
-	tracing::info!("Triggering video and audio pipelines...");
-	session_manager.trigger_streams_start().await;
-
-	// Send PING to the video socket so the packet handler learns the client
-	// address and actually transmits encoded frames over UDP (otherwise all
-	// packets are silently dropped waiting for a Moonlight client to connect).
-	let ping_addr: std::net::SocketAddr = "127.0.0.1:47998".parse().unwrap();
-	if let Ok(ping_sock) = UdpSocket::bind("127.0.0.1:0") {
-		let _ = ping_sock.send_to(b"PING", ping_addr);
-		tracing::debug!("Sent PING to video socket at {ping_addr}");
-	}
-
-	tracing::info!("Session active. Collecting stats...");
-
-	let warmup_deadline = Instant::now() + Duration::from_secs(args.warmup);
-	let mut accum = StatsAccumulator::new();
-	let mut total = StatsAccumulator::new();
-	let mut warned_no_frames = false;
-
-	let duration_deadline = if duration > 0 {
-		Some(Instant::now() + Duration::from_secs(duration))
-	} else {
-		None
+	// Keep the receiver alive for the whole session, including teardown. Bind
+	// errors are fatal: a run without a receiver is not a network benchmark.
+	let receiver = match receiver::Receiver::start(format!("127.0.0.1:{}", args.port).parse()?) {
+		Ok(receiver) => receiver,
+		Err(err) => {
+			let _ = session_manager.stop_session().await;
+			return Err(err.into());
+		},
 	};
+	session_manager.trigger_streams_start().await;
+	let origin = Instant::now();
+	let warmup_deadline = origin + Duration::from_secs(args.warmup);
+	let deadline = warmup_deadline + Duration::from_secs(duration);
+	let mut writer = match &args.output {
+		Some(output) if args.raw => {
+			match raw::RawWriter::new(&output.join(format!("run-{run:03}-frames.jsonl")), origin) {
+				Ok(writer) => Some(writer),
+				Err(err) => {
+					let _ = session_manager.stop_session().await;
+					return Err(err.into());
+				},
+			}
+		},
+		_ => None,
+	};
+	let mut accumulator = report::Accumulator::default();
+	let mut pending = VecDeque::new();
+	let mut counter_start = None;
+	let mut measurement_start = warmup_deadline;
+	let mut stats_lost = 0u64;
 	let mut interrupted = false;
-
+	let mut tick = tokio::time::interval(Duration::from_millis(20));
+	tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+	let mut last_print = Instant::now();
 	loop {
-		let duration_remaining = duration_deadline
-			.map(|d| d.saturating_duration_since(Instant::now()))
-			.unwrap_or(Duration::from_secs(86400 * 365 * 100)); // ~100 years = no limit
+		// Deadline branches precede frames so a flooded subscriber cannot extend a run.
 		tokio::select! {
 			biased;
-			result = stats_rx.recv() => {
-				match result {
-					Ok(stats) => {
-						if Instant::now() >= warmup_deadline {
-							if args.verbose {
-								tracing::info!(
-									"frame: total={}us ch_wait={}us import={}us convert={}us submit={}us queue={}us enc_wait={}us pkt={}us send={}us {} {}b",
-									stats.total.as_micros(),
-									stats.channel_wait.as_micros(),
-									stats.import.as_micros(),
-									stats.convert.as_micros(),
-									stats.submit.as_micros(),
-									stats.consumer_queue.as_micros(),
-									stats.encode_wait.as_micros(),
-									stats.packetize.as_micros(),
-									stats.send.as_micros(),
-									if stats.is_key_frame { "K" } else { "P" },
-									stats.encoded_bytes,
-								);
-							}
-							accum.add(&stats);
-							total.add(&stats);
-
-							if accum.last_print.elapsed() >= Duration::from_secs(5) {
-								accum = accum.print_and_reset_interval();
-							}
-
-							if duration_deadline.is_some_and(|d| Instant::now() >= d) {
-								tracing::info!("Duration reached, stopping...");
-								break;
-							}
-						}
-					},
-					Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-						tracing::warn!("Stats channel lagged, dropped {} frames", n);
-					},
-					Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-						tracing::info!("Stats channel closed (pipeline stopped).");
-						break;
-					},
+			_ = signal::ctrl_c() => { interrupted = true; break; },
+			_ = tokio::time::sleep_until(deadline.into()) => break,
+			_ = tokio::time::sleep_until(warmup_deadline.into()), if counter_start.is_none() => {
+				measurement_start = Instant::now();
+				counter_start = Some(session_manager.bench_counters());
+				tracing::info!("Warmup complete; recording measurement window");
+			},
+			_ = tick.tick() => {
+				resolve_receipts(&mut pending, &receiver, &mut accumulator, false);
+				if last_print.elapsed() >= Duration::from_secs(5) && counter_start.is_some() {
+					tracing::info!("Measured {} successful frames, {} failed; {} stats messages lost",
+						accumulator.successful_frames, accumulator.failed_frames, stats_lost);
+					last_print = Instant::now();
 				}
 			},
-			_ = signal::ctrl_c() => {
-				tracing::info!("Ctrl+C received, stopping...");
-				interrupted = true;
-				break;
-			},
-			_ = tokio::time::sleep(duration_remaining) => {
-				if duration_deadline.is_some_and(|d| Instant::now() >= d) {
-					tracing::info!("Duration reached, stopping...");
-					break;
-				}
-			},
-			_ = tokio::time::sleep(Duration::from_secs(3)) => {
-				if total.count == 0 && Instant::now() >= warmup_deadline && !warned_no_frames {
-					tracing::warn!("No frames received after 3s — check that the app renders to the compositor's Wayland/X11 display.");
-					warned_no_frames = true;
-				}
+			result = stats_rx.recv() => match result {
+				Ok(stats) if counter_start.is_some() && stats.capture_started_at >= measurement_start && stats.completed_at < deadline => {
+					if args.verbose { tracing::info!(frame=stats.frame_number, host_us=report::us(stats.total), path=?stats.capture_path, "frame"); }
+					accumulator.add(&stats, target_fps);
+					if let Some(writer) = &mut writer { writer.record(&stats); }
+					if stats.send_success && stats.capture_path != moonshine_core::session::stream::video::CapturePath::Reencode {
+						pending.push_back(stats);
+					} else { receiver.discard(stats.frame_number); }
+				},
+				Ok(stats) => receiver.discard(stats.frame_number),
+				Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+					if counter_start.is_some() { stats_lost += n; }
+				},
+				Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
 			},
 		}
 	}
-
-	let summary = if total.count == 0 {
-		tracing::warn!("No frames were encoded during the session.");
-		None
-	} else {
-		total.print_summary("Session")
+	let ended_at = Instant::now().min(deadline);
+	let counter_end = session_manager.bench_counters();
+	// Drain telemetry already published before the deadline (without measuring
+	// teardown), otherwise the last few frames would depend on subscriber wakeup.
+	loop {
+		let stats = match stats_rx.try_recv() {
+			Ok(stats) => stats,
+			Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+				stats_lost += n;
+				continue;
+			},
+			Err(_) => break,
+		};
+		if counter_start.is_some() && stats.capture_started_at >= measurement_start && stats.completed_at < ended_at {
+			accumulator.add(&stats, target_fps);
+			if let Some(writer) = &mut writer {
+				writer.record(&stats);
+			}
+			if stats.send_success && stats.capture_path != moonshine_core::session::stream::video::CapturePath::Reencode
+			{
+				pending.push_back(stats);
+			}
+		}
+	}
+	// Receipt grace is outside the measured window. It does not inflate FPS.
+	let receipt_deadline = Instant::now() + Duration::from_millis(250);
+	while !pending.is_empty() && Instant::now() < receipt_deadline {
+		resolve_receipts(&mut pending, &receiver, &mut accumulator, false);
+		if !pending.is_empty() {
+			tokio::time::sleep(Duration::from_millis(5)).await;
+		}
+	}
+	resolve_receipts(&mut pending, &receiver, &mut accumulator, true);
+	let stop_result = session_manager.stop_session().await;
+	let raw_dropped = match writer {
+		Some(writer) => writer.finish()?,
+		None => 0,
 	};
-
-	tracing::info!("Stopping session...");
-	let _ = session_manager.stop_session().await;
-
-	tracing::info!("Done.");
-	Ok(BenchmarkReport {
-		resolution_label,
-		resolution: format!("{}x{}", width, height),
-		target_fps,
-		codec: codec.to_string(),
-		summary,
-		interrupted,
-	})
+	let elapsed = ended_at.saturating_duration_since(measurement_start);
+	let summary = accumulator.summary(elapsed);
+	let counter_start = counter_start.unwrap_or_else(|| counter_end.clone());
+	let outstanding_start = report::outstanding(&counter_start);
+	let outstanding_end = report::outstanding(&counter_end);
+	let counters = report::counter_delta(&counter_end, &counter_start);
+	let mut invalid_reasons = Vec::new();
+	if cfg!(debug_assertions) {
+		invalid_reasons.push("debug_build");
+	}
+	if interrupted {
+		invalid_reasons.push("interrupted");
+	}
+	if elapsed < Duration::from_secs(duration).saturating_sub(Duration::from_millis(100)) {
+		invalid_reasons.push("short_measurement_window");
+	}
+	if summary.successful_frames == 0 {
+		invalid_reasons.push("no_successful_frames");
+	}
+	if stats_lost > 0 {
+		invalid_reasons.push("stats_messages_lost");
+	}
+	if raw_dropped > 0 {
+		invalid_reasons.push("raw_records_lost");
+	}
+	if receiver.counters().errors > 0 {
+		invalid_reasons.push("receiver_error");
+	}
+	if stop_result.is_err() {
+		invalid_reasons.push("session_stop_failed");
+	}
+	summary.print();
+	tracing::info!(?counters, stats_lost, raw_dropped, ?invalid_reasons, "Run quality");
+	let valid = invalid_reasons.is_empty();
+	if let Some(output) = &args.output {
+		let document = json!({
+			"schema_version": 1,
+			"label": args.label, "run": run, "repetition": repetition,
+			"unix_time_seconds": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+			"config": {"resolution":resolution,"fps":target_fps,"codec":codec,
+				"bitrate":args.bitrate,"composited":args.composited,"fec_percentage":args.fec,"minimum_fec_packets":2,
+				"packet_size":1400,"hdr":args.hdr,"gpu":args.gpu,"chroma":"yuv420",
+				"reference_frames":1,"encrypt_video":false,"full_range":false,
+				"duration_seconds":duration,"warmup_seconds":args.warmup,
+				"command":args.command,"workload":args.workload,"verbose":args.verbose,"raw":args.raw},
+			"environment":environment,
+			"valid":valid,"invalid_reasons":invalid_reasons,
+			"stats_messages_lost":stats_lost,"raw_records_lost":raw_dropped,
+			"counters":counters,"outstanding_submitted_frames_start":outstanding_start,
+			"outstanding_submitted_frames_end":outstanding_end,"receiver_lifetime_counters":receiver.counters(),
+			"summary":summary,
+			"measurement": {
+				"host_total":"capture start to completion of all socket send attempts; successful new captures only",
+				"loopback_complete":"capture start to userspace receipt of every emitted shard, including FEC; no decode",
+				"scene_wait":"first observed scene invalidation to capture start; diagnostic, not per-buffer presentation age",
+				"diagnostic_subsets":["render_wait within capture","consumer_queue within encode_wait"],
+				"histogram":"microseconds, 3 significant digits, fixed 60-second range; overflow invalidates percentiles",
+				"counter_window":"wall-clock measurement interval; boundary frames can be in flight, so counters are not a cohort identity",
+				"excluded":["input-to-game latency","application render time","client decode","client display"]
+			}
+		});
+		serde_json::to_writer_pretty(File::create_new(output.join(format!("run-{run:03}.json")))?, &document)?;
+	}
+	Ok((valid, interrupted))
 }
 
-fn print_matrix_summary(reports: &[MatrixReport]) {
-	tracing::info!("Moonshine benchmark matrix summary");
-	tracing::info!("Latency distributions (us): values are avg/p50/p95/p99/max");
-	tracing::info!(
-		"  {:<8} {:<10} {:>6} {:<5} {:<11} {:>7} {:>7} {:>8}  {:>24}  {:>24}  {:>24}",
-		"label",
-		"resolution",
-		"target",
-		"codec",
-		"status",
-		"frames",
-		"actual",
-		"mbps",
-		"total",
-		"submit",
-		"enc_wait"
-	);
-
-	for report in reports {
-		match &report.status {
-			MatrixStatus::Ok(Some(summary)) | MatrixStatus::Interrupted(Some(summary)) => {
-				let status = if matches!(&report.status, MatrixStatus::Ok(_)) {
-					"ok"
-				} else {
-					"interrupted"
-				};
-				tracing::info!(
-					"  {:<8} {:<10} {:>6} {:<5} {:<11} {:>7} {:>7.1} {:>8.2}  {:>24}  {:>24}  {:>24}",
-					report.resolution_label,
-					report.resolution,
-					report.target_fps,
-					report.codec,
-					status,
-					summary.count,
-					summary.fps,
-					summary.mbps,
-					summary.total.matrix_value(),
-					summary.submit.matrix_value(),
-					summary.encode_wait.matrix_value(),
-				);
-			},
-			MatrixStatus::Ok(None) | MatrixStatus::Interrupted(None) => {
-				let status = if matches!(&report.status, MatrixStatus::Ok(_)) {
-					"no-frames"
-				} else {
-					"interrupted"
-				};
-				tracing::info!(
-					"  {:<8} {:<10} {:>6} {:<5} {:<11}",
-					report.resolution_label,
-					report.resolution,
-					report.target_fps,
-					report.codec,
-					status
-				);
-			},
-			MatrixStatus::Failed(err) => {
-				tracing::info!(
-					"  {:<8} {:<10} {:>6} {:<5} failed: {}",
-					report.resolution_label,
-					report.resolution,
-					report.target_fps,
-					report.codec,
-					err
-				);
-			},
-		}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn invalid_dimensions_and_zero_duration_are_rejected() {
+		assert!(parse_resolution("0x1080").is_err());
+		assert!(parse_resolution("1920x0").is_err());
+		assert!(Args::try_parse_from(["bench", "--duration", "0", "--", "vkcube"]).is_err());
+		assert!(Args::try_parse_from(["bench", "--fps", "0", "--", "vkcube"]).is_err());
 	}
-
-	tracing::info!(
-		"Average pipeline breakdown (us/frame): additive stages; delta = total - accounted; queue_diag is included in enc_wait"
-	);
-	tracing::info!(
-		"  {:<8} {:<10} {:>6} {:<5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>8} {:>8} {:>6}",
-		"label",
-		"resolution",
-		"target",
-		"codec",
-		"ch_wait",
-		"import",
-		"convert",
-		"submit",
-		"enc_wait",
-		"pkt",
-		"send",
-		"accounted",
-		"delta",
-		"queue",
-		"key"
-	);
-	for report in reports {
-		if let MatrixStatus::Ok(Some(summary)) | MatrixStatus::Interrupted(Some(summary)) = &report.status {
-			tracing::info!(
-				"  {:<8} {:<10} {:>6} {:<5} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>10.0} {:>8.0} {:>8.0} {:>6}",
-				report.resolution_label,
-				report.resolution,
-				report.target_fps,
-				report.codec,
-				summary.avg_channel_wait_us,
-				summary.avg_import_us,
-				summary.avg_convert_us,
-				summary.submit.avg_us,
-				summary.encode_wait.avg_us,
-				summary.avg_packetize_us,
-				summary.avg_send_us,
-				summary.avg_accounted_us(),
-				summary.avg_delta_us(),
-				summary.avg_consumer_queue_us,
-				summary.key_frames,
-			);
-		}
-	}
-}
-
-fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
-	Box::new(std::io::Error::other(message.into()))
 }

@@ -360,8 +360,8 @@ impl CompositorHandler for MoonshineCompositor {
 	}
 
 	fn commit(&mut self, surface: &WlSurface) {
-		// Mark the screen as dirty so the next timer tick renders and sends a frame.
-		self.screen_dirty = true;
+		// Retain scene invalidation for immediate capture or timer fallback.
+		self.mark_scene_dirty();
 
 		// Apply pending color management state.
 		if let Some(cm) = &mut self.color_management {
@@ -372,6 +372,8 @@ impl CompositorHandler for MoonshineCompositor {
 		// space_render_elements can produce render elements from the
 		// attached buffer. Without this call surfaces appear bufferless
 		// and the rendered frame is always blank.
+		self.capture_trigger.observe_commit(surface);
+		super::buffer_timing::record(surface);
 		on_commit_buffer_handler::<Self>(surface);
 
 		// Ensure the surface is not a pending sync subsurface.
@@ -432,6 +434,9 @@ impl CompositorHandler for MoonshineCompositor {
 	}
 
 	fn destroyed(&mut self, surface: &WlSurface) {
+		if self.capture_trigger.destroyed(surface) {
+			self.mark_scene_dirty();
+		}
 		tracing::debug!(surface_id = ?surface.id(), "surface destroyed");
 		if let Some(cm) = &mut self.color_management {
 			cm.surface_destroyed(surface);
@@ -1574,7 +1579,7 @@ impl XdgShellHandler for MoonshineCompositor {
 	}
 
 	fn popup_destroyed(&mut self, _surface: PopupSurface) {
-		self.screen_dirty = true;
+		self.mark_scene_dirty();
 	}
 }
 
