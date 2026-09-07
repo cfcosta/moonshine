@@ -13,6 +13,11 @@
   vulkan-loader,
   wayland,
   libglvnd,
+  makeWrapper,
+  bash,
+  coreutils,
+  systemd,
+  xwayland,
 }:
 
 let
@@ -97,6 +102,7 @@ rustPlatform.buildRustPackage {
   cargoBuildFlags = [ "--workspace" ];
 
   nativeBuildInputs = [
+    makeWrapper
     addDriverRunpath # see postFixup
     cmake # inputtino-sys and aws-lc-sys build their C/C++ via cmake
     pkg-config
@@ -160,6 +166,19 @@ rustPlatform.buildRustPackage {
       ]
     } $out/bin/moonshine
     addDriverRunpath $out/bin/moonshine
+
+    # Consumers may use the nixpkgs service module instead of this flake's
+    # module, or launch the binary directly. Own our runtime executables here
+    # so session startup does not depend on the caller's PATH.
+    wrapProgram $out/bin/moonshine \
+      --prefix PATH : ${
+        lib.makeBinPath [
+          bash
+          coreutils
+          systemd
+          xwayland
+        ]
+      }
   '';
 
   meta = {

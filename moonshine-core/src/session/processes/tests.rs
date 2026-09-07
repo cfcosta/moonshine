@@ -5,6 +5,15 @@ use async_shutdown::ShutdownManager;
 use super::*;
 
 #[test]
+fn missing_runtime_executable_identifies_the_dependency() {
+	let name = "moonshine-test-missing-runtime-executable";
+	let error = runtime_executable(name).unwrap_err();
+	assert_eq!(error.kind(), io::ErrorKind::NotFound);
+	assert!(error.to_string().contains(name));
+	assert!(error.to_string().contains("PATH"));
+}
+
+#[test]
 fn cgroup_events_requires_an_explicit_population_value() {
 	assert_eq!(parse_populated("populated 1\nfrozen 0\n"), Ok(true));
 	assert_eq!(parse_populated("frozen 0\npopulated 0\n"), Ok(false));

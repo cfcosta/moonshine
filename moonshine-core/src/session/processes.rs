@@ -243,13 +243,12 @@ impl ProcessGroup {
 	}
 
 	fn write_xwayland_wrapper(&self) -> io::Result<()> {
-		self.write_xwayland_wrapper_for(&which::which("Xwayland").map_err(io::Error::other)?)
+		self.write_xwayland_wrapper_for(&runtime_executable("Xwayland")?)
 	}
 
 	fn write_xwayland_wrapper_for(&self, xwayland: &Path) -> io::Result<()> {
-		let resolve = |name| which::which(name).map_err(io::Error::other);
-		let shell = resolve("sh")?;
-		let runner = resolve("systemd-run")?;
+		let shell = runtime_executable("sh")?;
+		let runner = runtime_executable("systemd-run")?;
 		let args = [
 			runner.to_string_lossy().into_owned(),
 			"--user".into(),
@@ -281,7 +280,7 @@ impl ProcessGroup {
 		// EOF survives daemon crashes: systemd owns the reader, while only this
 		// daemon holds the CLOEXEC writer. When it closes, the guardian exits and
 		// BindsTo stops the entire slice, using systemd's own kill deadlines.
-		let cat = which::which("cat").map_err(|e| tracing::error!("Find session guardian reader: {e}"))?;
+		let cat = runtime_executable("cat").map_err(|e| tracing::error!("Find session guardian reader: {e}"))?;
 		let cat = cat.to_string_lossy().into_owned();
 		self.start_unit(
 			&self.guardian_unit,
@@ -317,7 +316,7 @@ impl ProcessGroup {
 		// Requisite gates late scope/service starts without resurrecting a stopped
 		// session. Stopping this gate propagates to both units; their After=
 		// ordering keeps Xwayland alive while the application stops.
-		let ready = which::which("true")
+		let ready = runtime_executable("true")
 			.map_err(|e| tracing::error!("Find session gate command: {e}"))?
 			.to_string_lossy()
 			.into_owned();
@@ -478,6 +477,15 @@ impl ProcessGroup {
 			);
 		})?
 	}
+}
+
+fn runtime_executable(name: &str) -> io::Result<PathBuf> {
+	which::which(name).map_err(|error| {
+		io::Error::new(
+			io::ErrorKind::NotFound,
+			format!("Required session executable '{name}' was not found on Moonshine's PATH: {error}"),
+		)
+	})
 }
 
 fn cgroup_path(path: &str) -> Result<PathBuf, ()> {
